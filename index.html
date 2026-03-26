@@ -229,20 +229,22 @@
         slide: [],
         spaceman: []
     };
-    let autoSequence = {};      // secuencia por juego, se calculará a partir de multipliers
-    let autoColors = {};        // colores por juego
-    let autoPendingSignal = null;   // señal activa en auto (global para el juego actual)
+    let autoEventIds = {
+        crash: new Set(),
+        slide: new Set(),
+        spaceman: new Set()
+    };
+    let autoPendingSignal = null;
     let autoSignalsEnabled = true;
     let autoClearTimer = null;
     let autoCompletedSignals = [];
     let autoLastEMA3 = null, autoLastEMA4 = null;
+    let autoLastMultiplier = null; // para evitar duplicados consecutivos
 
     // WebSocket y estado
     let ws = null;
     let reconnectTimer = null;
-    let lastAutoResult = null;   // para evitar duplicados consecutivos
 
-    // Constantes
     const SK_WIN_THRESHOLD = 1.85;
 
     // ======================== FUNCIONES COMUNES ========================
@@ -277,7 +279,7 @@
         updateAlertCircleVisibility(multipliers, currentMode === 'manual' ? manualPendingSignal : autoPendingSignal);
     }
 
-    // ================= INDICADORES TÉCNICOS (independientes de datos) =================
+    // ================= INDICADORES TÉCNICOS =================
     function calcEMA(data, period) {
         let ema = [], k = 2/(period+1);
         for(let i=0;i<data.length;i++) {
@@ -395,10 +397,6 @@
     function getPositions(sequence) {
         let pos = [0];
         for (let i = 1; i < sequence.length; i++) {
-            // sequence[i] es el nivel de secuencia, pero originalmente se basaba en si multiplier>=2.0.
-            // Necesitamos reconstruir a partir de los multiplicadores. Para simplificar, usaremos los multiplicadores originales.
-            // En modo automático, tenemos autoData[game] con multiplicadores, y sequence se calcula en base a ellos.
-            // Esta función se llamará con la secuencia de niveles (sequence) ya calculada.
             if (sequence[i] > sequence[i-1]) pos.push(pos[i-1] + 1);
             else pos.push(pos[i-1] - 1);
         }
@@ -571,6 +569,19 @@
         for(let tipo of ['EMAs 2.00x', 'WT 1.50x', 'BKout 1.50x', 'SK 2.00x']){ const s = stats[tipo]; const total = s.t; const aciertos = s.w1 + s.w2; const pct = total ? ((aciertos/total)*100).toFixed(1) : '0'; body.insertAdjacentHTML('beforeend', `<tr><td>${tipo}</td><td>${total}</td><td>${s.w1}</td><td>${s.w2}</td><td>${aciertos}</td><td>${s.l}</td><td>${pct}%</td></tr>`); }
     }
 
+    function scheduleClearMessageManual() {
+        if(manualClearTimer) clearTimeout(manualClearTimer);
+        manualClearTimer = setTimeout(()=>{
+            const circle = document.getElementById('alert-circulo');
+            circle.innerHTML = '🛜 NEUTRAL 🛜';
+            circle.style.display = 'flex';
+            document.getElementById('signalStatus').innerHTML = '---';
+            manualSignalsEnabled = true;
+            manualClearTimer = null;
+            updateAlertCircleVisibility(manualMultipliers, manualPendingSignal);
+        }, 10000);
+    }
+
     function addPointManual(multiplier) {
         if(!multiplier || isNaN(multiplier)) return;
         let signalProcessed = false;
@@ -615,19 +626,6 @@
         updateAlertCircleVisibility(manualMultipliers, manualPendingSignal);
     }
 
-    function scheduleClearMessageManual() {
-        if(manualClearTimer) clearTimeout(manualClearTimer);
-        manualClearTimer = setTimeout(()=>{
-            const circle = document.getElementById('alert-circulo');
-            circle.innerHTML = '🛜 NEUTRAL 🛜';
-            circle.style.display = 'flex';
-            document.getElementById('signalStatus').innerHTML = '---';
-            manualSignalsEnabled = true;
-            manualClearTimer = null;
-            updateAlertCircleVisibility(manualMultipliers, manualPendingSignal);
-        }, 10000);
-    }
-
     function deleteLastManual() {
         if(manualSequence.length===0) return;
         manualMultipliers.pop();
@@ -666,192 +664,6 @@
         actualizarBarraResultados(manualMultipliers);
         updateLowPercentWarning(manualMultipliers);
         updateAlertCircleVisibility(manualMultipliers, manualPendingSignal);
-    }
-
-    // ================= MODO AUTOMÁTICO =================
-    function getGameMultipliers() {
-        return autoData[selectedGame];
-    }
-
-    function getGameSequence() {
-        // Calcular secuencia a partir de los multiplicadores
-        const multipliers = autoData[selectedGame];
-        let seq = [];
-        for(let i=0; i<multipliers.length; i++) {
-            if(i===0) seq.push(0);
-            else seq.push(seq[i-1] + (multipliers[i] >= 2.0 ? 1 : -1));
-        }
-        return seq;
-    }
-
-    function getGameColors() {
-        return autoData[selectedGame].map(m => m<=1.99 ? '#00cfff' : m<=2.99 ? '#aa00ff' : m<=4.99 ? '#006400' : m<=9.99 ? '#ffff00' : '#8B0000');
-    }
-
-    function actualizarEstadisticasAuto() {
-        const mult = getGameMultipliers();
-        const total = mult.length;
-        document.getElementById('totalCount').innerText = total;
-        if(total===0) {
-            ['pctLow','pctMid','pctHigh','pctJackpot'].forEach(id=>document.getElementById(id).innerText='0%');
-            updateLowPercentWarning(mult);
-            return;
-        }
-        let low=0,mid=0,high=0,jack=0;
-        for(let m of mult){
-            if(m<2) low++;
-            else if(m<5) mid++;
-            else if(m<10) high++;
-            else jack++;
-        }
-        document.getElementById('pctLow').innerText = ((low/total)*100).toFixed(1)+'%';
-        document.getElementById('pctMid').innerText = ((mid/total)*100).toFixed(1)+'%';
-        document.getElementById('pctHigh').innerText = ((high/total)*100).toFixed(1)+'%';
-        document.getElementById('pctJackpot').innerText = ((jack/total)*100).toFixed(1)+'%';
-        updateLowPercentWarning(mult);
-    }
-
-    function actualizarEstadisticasSenalesAuto() {
-        const stats = { 'EMAs 2.00x': { t:0, w1:0, w2:0, l:0 }, 'WT 1.50x': { t:0, w1:0, w2:0, l:0 }, 'BKout 1.50x': { t:0, w1:0, w2:0, l:0 }, 'SK 2.00x': { t:0, w1:0, w2:0, l:0 } };
-        for(let sig of autoCompletedSignals) if(stats[sig.pattern]){ stats[sig.pattern].t++; if(sig.success1 && sig.success2===undefined) stats[sig.pattern].w1++; else if(sig.success1===false && sig.success2===true) stats[sig.pattern].w2++; else if(sig.success1===false && sig.success2===false) stats[sig.pattern].l++; }
-        const body = document.getElementById('signalsStatsBody'); body.innerHTML = '';
-        for(let tipo of ['EMAs 2.00x', 'WT 1.50x', 'BKout 1.50x', 'SK 2.00x']){ const s = stats[tipo]; const total = s.t; const aciertos = s.w1 + s.w2; const pct = total ? ((aciertos/total)*100).toFixed(1) : '0'; body.insertAdjacentHTML('beforeend', `<tr><td>${tipo}</td><td>${total}</td><td>${s.w1}</td><td>${s.w2}</td><td>${aciertos}</td><td>${s.l}</td><td>${pct}%</td></tr>`); }
-    }
-
-    function scheduleClearMessageAuto() {
-        if(autoClearTimer) clearTimeout(autoClearTimer);
-        autoClearTimer = setTimeout(()=>{
-            const circle = document.getElementById('alert-circulo');
-            circle.innerHTML = '🛜 NEUTRAL 🛜';
-            circle.style.display = 'flex';
-            document.getElementById('signalStatus').innerHTML = '---';
-            autoSignalsEnabled = true;
-            autoClearTimer = null;
-            updateAlertCircleVisibility(getGameMultipliers(), autoPendingSignal);
-        }, 10000);
-    }
-
-    function addPointAuto(multiplier, game) {
-        // Solo se llama cuando se recibe un nuevo evento del juego seleccionado
-        if(game !== selectedGame) return;
-        let signalProcessed = false;
-        const multipliers = autoData[selectedGame];
-        const sequence = getGameSequence(); // secuencia antes de añadir
-        if(autoPendingSignal !== null) {
-            signalProcessed = procesarIntento(multiplier, autoPendingSignal, autoCompletedSignals, true,
-                (val) => { autoSignalsEnabled = val; },
-                () => actualizarEstadisticasSenalesAuto(),
-                () => scheduleClearMessageAuto(),
-                (val) => { autoPendingSignal = val; },
-                (txt) => { document.getElementById('signalStatus').innerHTML = txt; }
-            );
-        }
-        autoData[selectedGame].push(multiplier);
-        // Recalcular secuencia y colores para el gráfico
-        const newSeq = getGameSequence();
-        const newColors = getGameColors();
-        document.getElementById('seqLength').innerText = newSeq.length;
-        actualizarEstadisticasAuto();
-        actualizarGraficoAuto();
-        actualizarBarraResultados(multipliers);
-        updateLowPercentWarning(multipliers);
-
-        if(autoSignalsEnabled && !signalProcessed) {
-            const lowPct = getLowPercentage(multipliers);
-            let patron = detectarPatronGeneralOriginal(newSeq, multipliers, true, lowPct, autoLastEMA3, autoLastEMA4);
-            if(!patron) patron = detectarNuevasSenales(newSeq, multipliers, true, lowPct);
-            if(patron) {
-                autoPendingSignal = { 
-                    pattern: patron.pattern, 
-                    displayText: patron.title, 
-                    target: patron.target,
-                    attempts: 0, 
-                    results: [] 
-                };
-                autoSignalsEnabled = false;
-                mostrarAlertaSeñal(patron);
-                document.getElementById('signalStatus').innerHTML = patron.title;
-            }
-        }
-        updateAlertCircleVisibility(multipliers, autoPendingSignal);
-    }
-
-    function actualizarGraficoAuto() {
-        if(!chartInstance) return;
-        const multipliers = getGameMultipliers();
-        const sequence = getGameSequence();
-        const colors = getGameColors();
-        const mostrar = sequence.slice(-maxPoints);
-        const colores = colors.slice(-maxPoints);
-        const numPuntos = mostrar.length;
-        chartInstance.data.labels = mostrar.map((_,i)=> i+1);
-        chartInstance.data.datasets[24].data = [...mostrar];
-        chartInstance.data.datasets[24].pointBackgroundColor = colores;
-        const canvas = document.getElementById('mainChart');
-        const anchoCanvas = canvas.clientWidth;
-        let puntoRadio = 6, lineWidth = 2.5;
-        if (numPuntos > 0 && anchoCanvas > 0) { const espaciado = anchoCanvas / numPuntos; puntoRadio = Math.min(7, Math.max(3, espaciado / 10)); lineWidth = Math.max(1.5, puntoRadio * 0.5); }
-        chartInstance.data.datasets[24].pointRadius = puntoRadio;
-        chartInstance.data.datasets[24].pointBorderWidth = Math.max(1, puntoRadio * 0.3);
-        chartInstance.data.datasets[24].borderWidth = lineWidth;
-
-        if(sequence.length===0){
-            for(let i=0;i<=23;i++) if(chartInstance.data.datasets[i]) chartInstance.data.datasets[i].data=[];
-            chartInstance.update(); return;
-        }
-        const positions = getPositions(sequence);
-        const ema4 = calcEMA(positions, 4);
-        const ema8 = calcEMA(positions, 8);
-        const ema20 = calcEMA(positions, 20);
-        const trim = (arr) => arr.slice(-maxPoints);
-        const boll = calcBollinger20(sequence);
-        const srAvanzado = detectarSoportesResistenciasAvanzado(sequence);
-        
-        chartInstance.data.datasets[0].data = trim(boll.upper);
-        chartInstance.data.datasets[1].data = trim(boll.lower);
-        chartInstance.data.datasets[2].data = trim(ema4);
-        chartInstance.data.datasets[3].data = trim(ema8);
-        chartInstance.data.datasets[8].data = trim(ema20);
-        if(chartInstance.data.datasets[4]) chartInstance.data.datasets[4].data = (srAvanzado.soportes[0] ? new Array(mostrar.length).fill(srAvanzado.soportes[0].nivel) : []);
-        if(chartInstance.data.datasets[5]) chartInstance.data.datasets[5].data = (srAvanzado.soportes[1] ? new Array(mostrar.length).fill(srAvanzado.soportes[1].nivel) : []);
-        if(chartInstance.data.datasets[6]) chartInstance.data.datasets[6].data = (srAvanzado.resistencias[0] ? new Array(mostrar.length).fill(srAvanzado.resistencias[0].nivel) : []);
-        if(chartInstance.data.datasets[7]) chartInstance.data.datasets[7].data = (srAvanzado.resistencias[1] ? new Array(mostrar.length).fill(srAvanzado.resistencias[1].nivel) : []);
-
-        // Líneas de soporte alto (amarillo/rosa)
-        const countsYellow = new Map(), countsPink = new Map();
-        for (let m of multipliers) {
-            if (m >= 5.0 && m < 10.0) { const key = m.toFixed(2); countsYellow.set(key, (countsYellow.get(key) || 0) + 1); }
-            else if (m >= 10.0) { const key = m.toFixed(2); countsPink.set(key, (countsPink.get(key) || 0) + 1); }
-        }
-        const yellowLevels = Array.from(countsYellow.entries()).filter(([_,c]) => c >= 5).map(([v,_]) => parseFloat(v)).sort((a,b)=>a-b);
-        const pinkLevels = Array.from(countsPink.entries()).filter(([_,c]) => c >= 5).map(([v,_]) => parseFloat(v)).sort((a,b)=>a-b);
-        for(let i=0; i<10; i++) {
-            const ds = chartInstance.data.datasets[9 + i];
-            if(i < yellowLevels.length) { ds.data = new Array(mostrar.length).fill(yellowLevels[i]); ds.hidden = false; ds.borderColor = '#ffff00'; ds.label = `Soporte 5x-9.99x (${yellowLevels[i].toFixed(2)}x)`; }
-            else { ds.data = []; ds.hidden = true; }
-        }
-        for(let i=0; i<5; i++) {
-            const ds = chartInstance.data.datasets[19 + i];
-            if(i < pinkLevels.length) { ds.data = new Array(mostrar.length).fill(pinkLevels[i]); ds.hidden = false; ds.borderColor = '#ff69b4'; ds.label = `Soporte 10x+ (${pinkLevels[i].toFixed(2)}x)`; }
-            else { ds.data = []; ds.hidden = true; }
-        }
-
-        const toggles = {
-            boll: document.getElementById('toggleBollinger')?.checked ?? true,
-            ema4: document.getElementById('toggleEMA4')?.checked ?? true,
-            ema8: document.getElementById('toggleEMA8')?.checked ?? true,
-            ema20: document.getElementById('toggleEMA20')?.checked ?? true,
-            srAdvanced: document.getElementById('toggleSRlinesAdvanced')?.checked ?? true
-        };
-        for(let i=0;i<chartInstance.data.datasets.length;i++) if(i!==24) chartInstance.data.datasets[i].hidden = true;
-        if(toggles.boll) { chartInstance.data.datasets[0].hidden=false; chartInstance.data.datasets[1].hidden=false; }
-        if(toggles.ema4) chartInstance.data.datasets[2].hidden=false;
-        if(toggles.ema8) chartInstance.data.datasets[3].hidden=false;
-        if(toggles.ema20) chartInstance.data.datasets[8].hidden=false;
-        if(toggles.srAdvanced) { for(let i=4;i<=7;i++) if(chartInstance.data.datasets[i]) chartInstance.data.datasets[i].hidden=false; }
-        for(let i=0;i<10;i++) if(chartInstance.data.datasets[9+i] && chartInstance.data.datasets[9+i].data.length>0) chartInstance.data.datasets[9+i].hidden=false;
-        for(let i=0;i<5;i++) if(chartInstance.data.datasets[19+i] && chartInstance.data.datasets[19+i].data.length>0) chartInstance.data.datasets[19+i].hidden=false;
-        chartInstance.update();
     }
 
     function actualizarGraficoManual() {
@@ -929,6 +741,238 @@
         chartInstance.update();
     }
 
+    // ================= MODO AUTOMÁTICO =================
+    function getGameMultipliers() {
+        return autoData[selectedGame];
+    }
+
+    function getGameSequence() {
+        const multipliers = autoData[selectedGame];
+        let seq = [];
+        for(let i=0; i<multipliers.length; i++) {
+            if(i===0) seq.push(0);
+            else seq.push(seq[i-1] + (multipliers[i] >= 2.0 ? 1 : -1));
+        }
+        return seq;
+    }
+
+    function getGameColors() {
+        return autoData[selectedGame].map(m => m<=1.99 ? '#00cfff' : m<=2.99 ? '#aa00ff' : m<=4.99 ? '#006400' : m<=9.99 ? '#ffff00' : '#8B0000');
+    }
+
+    function actualizarEstadisticasAuto() {
+        const mult = getGameMultipliers();
+        const total = mult.length;
+        document.getElementById('totalCount').innerText = total;
+        if(total===0) {
+            ['pctLow','pctMid','pctHigh','pctJackpot'].forEach(id=>document.getElementById(id).innerText='0%');
+            updateLowPercentWarning(mult);
+            return;
+        }
+        let low=0,mid=0,high=0,jack=0;
+        for(let m of mult){
+            if(m<2) low++;
+            else if(m<5) mid++;
+            else if(m<10) high++;
+            else jack++;
+        }
+        document.getElementById('pctLow').innerText = ((low/total)*100).toFixed(1)+'%';
+        document.getElementById('pctMid').innerText = ((mid/total)*100).toFixed(1)+'%';
+        document.getElementById('pctHigh').innerText = ((high/total)*100).toFixed(1)+'%';
+        document.getElementById('pctJackpot').innerText = ((jack/total)*100).toFixed(1)+'%';
+        updateLowPercentWarning(mult);
+    }
+
+    function actualizarEstadisticasSenalesAuto() {
+        const stats = { 'EMAs 2.00x': { t:0, w1:0, w2:0, l:0 }, 'WT 1.50x': { t:0, w1:0, w2:0, l:0 }, 'BKout 1.50x': { t:0, w1:0, w2:0, l:0 }, 'SK 2.00x': { t:0, w1:0, w2:0, l:0 } };
+        for(let sig of autoCompletedSignals) if(stats[sig.pattern]){ stats[sig.pattern].t++; if(sig.success1 && sig.success2===undefined) stats[sig.pattern].w1++; else if(sig.success1===false && sig.success2===true) stats[sig.pattern].w2++; else if(sig.success1===false && sig.success2===false) stats[sig.pattern].l++; }
+        const body = document.getElementById('signalsStatsBody'); body.innerHTML = '';
+        for(let tipo of ['EMAs 2.00x', 'WT 1.50x', 'BKout 1.50x', 'SK 2.00x']){ const s = stats[tipo]; const total = s.t; const aciertos = s.w1 + s.w2; const pct = total ? ((aciertos/total)*100).toFixed(1) : '0'; body.insertAdjacentHTML('beforeend', `<tr><td>${tipo}</td><td>${total}</td><td>${s.w1}</td><td>${s.w2}</td><td>${aciertos}</td><td>${s.l}</td><td>${pct}%</td></tr>`); }
+    }
+
+    function scheduleClearMessageAuto() {
+        if(autoClearTimer) clearTimeout(autoClearTimer);
+        autoClearTimer = setTimeout(()=>{
+            const circle = document.getElementById('alert-circulo');
+            circle.innerHTML = '🛜 NEUTRAL 🛜';
+            circle.style.display = 'flex';
+            document.getElementById('signalStatus').innerHTML = '---';
+            autoSignalsEnabled = true;
+            autoClearTimer = null;
+            updateAlertCircleVisibility(getGameMultipliers(), autoPendingSignal);
+        }, 10000);
+    }
+
+    function refreshAutoUI(newMultiplier = null) {
+        const multipliers = getGameMultipliers();
+        const sequence = getGameSequence();
+        const colors = getGameColors();
+        const total = multipliers.length;
+        document.getElementById('seqLength').innerText = total;
+        actualizarEstadisticasAuto();
+        actualizarEstadisticasSenalesAuto();
+        actualizarBarraResultados(multipliers);
+        updateLowPercentWarning(multipliers);
+
+        let signalProcessed = false;
+        if (newMultiplier !== null && autoSignalsEnabled && autoPendingSignal !== null) {
+            signalProcessed = procesarIntento(newMultiplier, autoPendingSignal, autoCompletedSignals, true,
+                (val) => { autoSignalsEnabled = val; },
+                () => actualizarEstadisticasSenalesAuto(),
+                () => scheduleClearMessageAuto(),
+                (val) => { autoPendingSignal = val; },
+                (txt) => { document.getElementById('signalStatus').innerHTML = txt; }
+            );
+        }
+        if (newMultiplier !== null && autoSignalsEnabled && !signalProcessed) {
+            const lowPct = getLowPercentage(multipliers);
+            let patron = detectarPatronGeneralOriginal(sequence, multipliers, true, lowPct, autoLastEMA3, autoLastEMA4);
+            if (!patron) patron = detectarNuevasSenales(sequence, multipliers, true, lowPct);
+            if (patron) {
+                autoPendingSignal = {
+                    pattern: patron.pattern,
+                    displayText: patron.title,
+                    target: patron.target,
+                    attempts: 0,
+                    results: []
+                };
+                autoSignalsEnabled = false;
+                mostrarAlertaSeñal(patron);
+                document.getElementById('signalStatus').innerHTML = patron.title;
+            }
+        }
+
+        actualizarGraficoAuto();
+        updateAlertCircleVisibility(multipliers, autoPendingSignal);
+    }
+
+    function actualizarGraficoAuto() {
+        if(!chartInstance) return;
+        const multipliers = getGameMultipliers();
+        const sequence = getGameSequence();
+        const colors = getGameColors();
+        const mostrar = sequence.slice(-maxPoints);
+        const colores = colors.slice(-maxPoints);
+        const numPuntos = mostrar.length;
+        chartInstance.data.labels = mostrar.map((_,i)=> i+1);
+        chartInstance.data.datasets[24].data = [...mostrar];
+        chartInstance.data.datasets[24].pointBackgroundColor = colores;
+        const canvas = document.getElementById('mainChart');
+        const anchoCanvas = canvas.clientWidth;
+        let puntoRadio = 6, lineWidth = 2.5;
+        if (numPuntos > 0 && anchoCanvas > 0) { const espaciado = anchoCanvas / numPuntos; puntoRadio = Math.min(7, Math.max(3, espaciado / 10)); lineWidth = Math.max(1.5, puntoRadio * 0.5); }
+        chartInstance.data.datasets[24].pointRadius = puntoRadio;
+        chartInstance.data.datasets[24].pointBorderWidth = Math.max(1, puntoRadio * 0.3);
+        chartInstance.data.datasets[24].borderWidth = lineWidth;
+
+        if(sequence.length===0){
+            for(let i=0;i<=23;i++) if(chartInstance.data.datasets[i]) chartInstance.data.datasets[i].data=[];
+            chartInstance.update(); return;
+        }
+        const positions = getPositions(sequence);
+        const ema4 = calcEMA(positions, 4);
+        const ema8 = calcEMA(positions, 8);
+        const ema20 = calcEMA(positions, 20);
+        const trim = (arr) => arr.slice(-maxPoints);
+        const boll = calcBollinger20(sequence);
+        const srAvanzado = detectarSoportesResistenciasAvanzado(sequence);
+        
+        chartInstance.data.datasets[0].data = trim(boll.upper);
+        chartInstance.data.datasets[1].data = trim(boll.lower);
+        chartInstance.data.datasets[2].data = trim(ema4);
+        chartInstance.data.datasets[3].data = trim(ema8);
+        chartInstance.data.datasets[8].data = trim(ema20);
+        if(chartInstance.data.datasets[4]) chartInstance.data.datasets[4].data = (srAvanzado.soportes[0] ? new Array(mostrar.length).fill(srAvanzado.soportes[0].nivel) : []);
+        if(chartInstance.data.datasets[5]) chartInstance.data.datasets[5].data = (srAvanzado.soportes[1] ? new Array(mostrar.length).fill(srAvanzado.soportes[1].nivel) : []);
+        if(chartInstance.data.datasets[6]) chartInstance.data.datasets[6].data = (srAvanzado.resistencias[0] ? new Array(mostrar.length).fill(srAvanzado.resistencias[0].nivel) : []);
+        if(chartInstance.data.datasets[7]) chartInstance.data.datasets[7].data = (srAvanzado.resistencias[1] ? new Array(mostrar.length).fill(srAvanzado.resistencias[1].nivel) : []);
+
+        // Líneas de soporte alto
+        const countsYellow = new Map(), countsPink = new Map();
+        for (let m of multipliers) {
+            if (m >= 5.0 && m < 10.0) { const key = m.toFixed(2); countsYellow.set(key, (countsYellow.get(key) || 0) + 1); }
+            else if (m >= 10.0) { const key = m.toFixed(2); countsPink.set(key, (countsPink.get(key) || 0) + 1); }
+        }
+        const yellowLevels = Array.from(countsYellow.entries()).filter(([_,c]) => c >= 5).map(([v,_]) => parseFloat(v)).sort((a,b)=>a-b);
+        const pinkLevels = Array.from(countsPink.entries()).filter(([_,c]) => c >= 5).map(([v,_]) => parseFloat(v)).sort((a,b)=>a-b);
+        for(let i=0; i<10; i++) {
+            const ds = chartInstance.data.datasets[9 + i];
+            if(i < yellowLevels.length) { ds.data = new Array(mostrar.length).fill(yellowLevels[i]); ds.hidden = false; ds.borderColor = '#ffff00'; ds.label = `Soporte 5x-9.99x (${yellowLevels[i].toFixed(2)}x)`; }
+            else { ds.data = []; ds.hidden = true; }
+        }
+        for(let i=0; i<5; i++) {
+            const ds = chartInstance.data.datasets[19 + i];
+            if(i < pinkLevels.length) { ds.data = new Array(mostrar.length).fill(pinkLevels[i]); ds.hidden = false; ds.borderColor = '#ff69b4'; ds.label = `Soporte 10x+ (${pinkLevels[i].toFixed(2)}x)`; }
+            else { ds.data = []; ds.hidden = true; }
+        }
+
+        const toggles = {
+            boll: document.getElementById('toggleBollinger')?.checked ?? true,
+            ema4: document.getElementById('toggleEMA4')?.checked ?? true,
+            ema8: document.getElementById('toggleEMA8')?.checked ?? true,
+            ema20: document.getElementById('toggleEMA20')?.checked ?? true,
+            srAdvanced: document.getElementById('toggleSRlinesAdvanced')?.checked ?? true
+        };
+        for(let i=0;i<chartInstance.data.datasets.length;i++) if(i!==24) chartInstance.data.datasets[i].hidden = true;
+        if(toggles.boll) { chartInstance.data.datasets[0].hidden=false; chartInstance.data.datasets[1].hidden=false; }
+        if(toggles.ema4) chartInstance.data.datasets[2].hidden=false;
+        if(toggles.ema8) chartInstance.data.datasets[3].hidden=false;
+        if(toggles.ema20) chartInstance.data.datasets[8].hidden=false;
+        if(toggles.srAdvanced) { for(let i=4;i<=7;i++) if(chartInstance.data.datasets[i]) chartInstance.data.datasets[i].hidden=false; }
+        for(let i=0;i<10;i++) if(chartInstance.data.datasets[9+i] && chartInstance.data.datasets[9+i].data.length>0) chartInstance.data.datasets[9+i].hidden=false;
+        for(let i=0;i<5;i++) if(chartInstance.data.datasets[19+i] && chartInstance.data.datasets[19+i].data.length>0) chartInstance.data.datasets[19+i].hidden=false;
+        chartInstance.update();
+    }
+
+    // ================= WEBSOCKET =================
+    function conectarWS() {
+        if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) ws.close();
+        const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+        const wsUrl = `${protocol}//${window.location.host}/ws`;
+        ws = new WebSocket(wsUrl);
+        ws.onopen = () => {
+            document.getElementById('wsStatusIcon').innerHTML = '🟢 Auto conectado';
+            console.log('WebSocket conectado');
+        };
+        ws.onmessage = (event) => {
+            if (currentMode !== 'auto') return;
+            try {
+                const data = JSON.parse(event.data);
+                if (data.tipo === 'historial') {
+                    const api = data.api;
+                    if (api && data.eventos && Array.isArray(data.eventos)) {
+                        autoData[api] = data.eventos.map(e => e.maxMultiplier).filter(m => m && m > 0);
+                        autoEventIds[api] = new Set(data.eventos.map(e => e.event_id).filter(id => id));
+                        if (api === selectedGame) {
+                            refreshAutoUI();
+                        }
+                    }
+                } else if (data.tipo === 'crash' || data.tipo === 'slide' || data.tipo === 'spaceman') {
+                    const game = data.tipo;
+                    const eventId = data.id;
+                    const mult = data.maxMultiplier;
+                    if (mult && mult > 0 && eventId) {
+                        if (autoEventIds[game].has(eventId)) return;
+                        autoEventIds[game].add(eventId);
+                        autoData[game].push(mult);
+                        if (game === selectedGame) {
+                            if (mult !== autoLastMultiplier) {
+                                autoLastMultiplier = mult;
+                                refreshAutoUI(mult);
+                            }
+                        }
+                    }
+                }
+            } catch (err) { console.warn(err); }
+        };
+        ws.onclose = () => {
+            document.getElementById('wsStatusIcon').innerHTML = '🔴 Reconectando...';
+            if (reconnectTimer) clearTimeout(reconnectTimer);
+            reconnectTimer = setTimeout(() => conectarWS(), 3000);
+        };
+        ws.onerror = (err) => console.error('WebSocket error:', err);
+    }
+
     function actualizarBarraResultados(multipliers) {
         const container = document.getElementById('recentResultsBar');
         if (!container) return;
@@ -974,62 +1018,7 @@
         datasets.push({ label: 'WaveTrend', data: [], borderColor: '#aaffff', borderWidth: 2, pointRadius: 0, hidden: true });
         datasets.push({ label: 'WT Señal', data: [], borderColor: '#ff8888', borderWidth: 2, pointRadius: 0, hidden: true });
         chartInstance = new Chart(ctx, { type: 'line', data: { labels: [], datasets }, options: { responsive: true, maintainAspectRatio: true, animation: { duration: 200 }, scales: { y: { grid: { color: '#226622' }, title: { display: true, text: 'Nivel', color: '#ccffcc' } }, y1: { position: 'right', min: 0, max: 100, grid: { drawOnChartArea: false }, title: { text: 'RSI', color: '#ff99cc' } } }, plugins: { legend: { display: false } } } });
-        actualizarGraficoManual(); // inicial con datos vacíos
-    }
-
-    // ================= WEBSOCKET =================
-    function conectarWS() {
-        if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) ws.close();
-        const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-        const wsUrl = `${protocol}//${window.location.host}/ws`;
-        ws = new WebSocket(wsUrl);
-        ws.onopen = () => {
-            document.getElementById('wsStatusIcon').innerHTML = '🟢 Auto conectado';
-            console.log('WebSocket conectado');
-        };
-        ws.onmessage = (event) => {
-            if (currentMode !== 'auto') return;
-            try {
-                const data = JSON.parse(event.data);
-                if (data.tipo === 'historial') {
-                    // Almacenar eventos históricos en autoData[data.api]
-                    const api = data.api;
-                    if (api && data.eventos && Array.isArray(data.eventos)) {
-                        const multipliers = data.eventos.map(e => e.maxMultiplier).filter(m => m && m > 0);
-                        autoData[api] = multipliers;
-                        // Si es el juego actual, refrescar gráfico y estadísticas
-                        if (api === selectedGame) {
-                            document.getElementById('seqLength').innerText = multipliers.length;
-                            actualizarEstadisticasAuto();
-                            actualizarGraficoAuto();
-                            actualizarBarraResultados(multipliers);
-                            updateLowPercentWarning(multipliers);
-                        }
-                    }
-                } else if (data.tipo === 'crash' || data.tipo === 'slide' || data.tipo === 'spaceman') {
-                    const game = data.tipo;
-                    const mult = data.maxMultiplier;
-                    if (mult && mult > 0) {
-                        // Guardar en autoData[game]
-                        autoData[game].push(mult);
-                        // Si es el juego seleccionado, añadir al gráfico
-                        if (game === selectedGame) {
-                            // Evitar duplicados consecutivos (por si acaso)
-                            if (mult !== lastAutoResult) {
-                                lastAutoResult = mult;
-                                addPointAuto(mult, game);
-                            }
-                        }
-                    }
-                }
-            } catch (err) { console.warn(err); }
-        };
-        ws.onclose = () => {
-            document.getElementById('wsStatusIcon').innerHTML = '🔴 Reconectando...';
-            if (reconnectTimer) clearTimeout(reconnectTimer);
-            reconnectTimer = setTimeout(() => conectarWS(), 3000);
-        };
-        ws.onerror = (err) => console.error('WebSocket error:', err);
+        actualizarGraficoManual();
     }
 
     function setModo(manual) {
@@ -1044,7 +1033,6 @@
             document.getElementById('modeText').innerText = 'Manual';
             if (ws) ws.close();
             document.getElementById('wsStatusIcon').innerHTML = '🔌 Manual';
-            // Resetear el gráfico a los datos manuales actuales (si hay)
             actualizarGraficoManual();
             actualizarEstadisticasManual();
             actualizarEstadisticasSenalesManual();
@@ -1060,14 +1048,7 @@
             document.getElementById('gameSelectorGroup').style.display = 'flex';
             document.getElementById('modeText').innerText = 'Automático';
             conectarWS();
-            // Forzar refresco del juego actual
-            actualizarGraficoAuto();
-            actualizarEstadisticasAuto();
-            actualizarEstadisticasSenalesAuto();
-            actualizarBarraResultados(getGameMultipliers());
-            document.getElementById('seqLength').innerText = getGameMultipliers().length;
-            updateLowPercentWarning(getGameMultipliers());
-            updateAlertCircleVisibility(getGameMultipliers(), autoPendingSignal);
+            refreshAutoUI();
         }
     }
 
@@ -1076,22 +1057,16 @@
         document.querySelectorAll('.game-btn').forEach(btn => btn.classList.remove('active'));
         document.getElementById(`game${game.charAt(0).toUpperCase() + game.slice(1)}`).classList.add('active');
         document.getElementById('gameActiveSpan').innerHTML = `🎮 Juego: ${game.charAt(0).toUpperCase() + game.slice(1)}`;
-        lastAutoResult = null;
+        autoLastMultiplier = null;
         if (currentMode === 'auto') {
-            actualizarGraficoAuto();
-            actualizarEstadisticasAuto();
-            actualizarEstadisticasSenalesAuto();
-            actualizarBarraResultados(getGameMultipliers());
-            document.getElementById('seqLength').innerText = getGameMultipliers().length;
-            updateLowPercentWarning(getGameMultipliers());
-            updateAlertCircleVisibility(getGameMultipliers(), autoPendingSignal);
+            refreshAutoUI();
         }
     }
 
     // ================= INICIO =================
     document.addEventListener('DOMContentLoaded', () => {
         initChart();
-        setModo(true); // empezar en manual
+        setModo(true);
         setGame('crash');
 
         document.getElementById('btnManualMode')?.addEventListener('click', () => setModo(true));
