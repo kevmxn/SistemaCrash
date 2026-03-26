@@ -128,7 +128,7 @@
         <button id="btnManualMode" class="mode-btn active">Manual</button>
         <button id="btnAutoMode" class="mode-btn">Auto</button>
     </div>
-    <div class="game-group" id="gameSelectorGroup">
+    <div class="game-group" id="gameSelectorGroup" style="display: none;">
         <button id="gameCrash" class="game-btn active" data-game="crash">Crash</button>
         <button id="gameSlide" class="game-btn" data-game="slide">Slide</button>
         <button id="gameSpaceman" class="game-btn" data-game="spaceman">Spaceman</button>
@@ -155,7 +155,7 @@
     <span>🎯 Señal actual: <span id="signalStatus">---</span></span>
     <span>📈 Secuencia: <span id="seqLength">0</span></span>
     <span>⚡ Modo: <span id="modeText">Manual</span></span>
-    <span id="gameActiveSpan">🎮 Juego: Crash</span>
+    <span id="gameActiveSpan"></span>
     <span id="lowPercentWarning" style="display: none;">⚠️ Tendencia Bajista</span>
 </div>
 
@@ -187,9 +187,9 @@
         <h3>📈 Estadísticas de Señales</h3>
         <div style="overflow-x: auto;">
             <table id="signalsStatsTable">
-                <thead><tr><th>Tipos de señales</th><th>T</th><th>W1</th><th>W2</th><th>WTs</th><th>L</th><th>Efic. %</th> </thead>
+                <thead><tr><th>Tipos de señales</th><th>T</th><th>W1</th><th>W2</th><th>WTs</th><th>L</th><th>Efic. %</th></tr></thead>
                 <tbody id="signalsStatsBody"></tbody>
-             </table>
+            </table>
         </div>
     </div>
 </div>
@@ -208,32 +208,54 @@
 
 <script>
     // ======================== GLOBALES ========================
-    let rawMultipliers = [];
-    let sequenceLevels = [];
-    let coloresPuntos = [];
+    let currentMode = "manual";          // "manual" o "auto"
+    let selectedGame = "crash";          // "crash", "slide", "spaceman"
     let maxPoints = 300;
-    let modoAutomatico = false;
-    let selectedGame = "crash"; // crash, slide, spaceman
     let chartInstance = null;
-    let signalsEnabled = true;
-    let clearTimer = null;
-    
-    let pendingSignal = null;
-    let completedSignals = [];
-    
-    let lastEMA3 = null, lastEMA4 = null;
+
+    // Datos para modo manual
+    let manualMultipliers = [];
+    let manualSequence = [];
+    let manualColors = [];
+    let manualPendingSignal = null;
+    let manualSignalsEnabled = true;
+    let manualClearTimer = null;
+    let manualCompletedSignals = [];
+    let manualLastEMA3 = null, manualLastEMA4 = null;
+
+    // Datos para modo automático (por juego)
+    let autoData = {
+        crash: [],
+        slide: [],
+        spaceman: []
+    };
+    let autoSequence = {};      // secuencia por juego, se calculará a partir de multipliers
+    let autoColors = {};        // colores por juego
+    let autoPendingSignal = null;   // señal activa en auto (global para el juego actual)
+    let autoSignalsEnabled = true;
+    let autoClearTimer = null;
+    let autoCompletedSignals = [];
+    let autoLastEMA3 = null, autoLastEMA4 = null;
+
+    // WebSocket y estado
+    let ws = null;
+    let reconnectTimer = null;
+    let lastAutoResult = null;   // para evitar duplicados consecutivos
+
+    // Constantes
     const SK_WIN_THRESHOLD = 1.85;
-    
-    function getLowPercentage() {
-        const total = rawMultipliers.length;
+
+    // ======================== FUNCIONES COMUNES ========================
+    function getLowPercentage(multipliers) {
+        const total = multipliers.length;
         if (total === 0) return 0;
-        return (rawMultipliers.filter(m => m < 2.0).length / total) * 100;
+        return (multipliers.filter(m => m < 2.0).length / total) * 100;
     }
 
-    function updateAlertCircleVisibility() {
+    function updateAlertCircleVisibility(multipliers, pendingSignal) {
         const circle = document.getElementById('alert-circulo');
         if (!circle) return;
-        const lowPct = getLowPercentage();
+        const lowPct = getLowPercentage(multipliers);
         const isNeutral = circle.innerHTML.includes('🛜 NEUTRAL 🛜');
         const hasActiveSignal = (pendingSignal !== null) || !isNeutral;
         if (hasActiveSignal) circle.style.display = 'flex';
@@ -241,19 +263,21 @@
         else circle.style.display = 'flex';
     }
 
-    function updateLowPercentWarning() {
-        const pctLow = getLowPercentage();
+    function updateLowPercentWarning(multipliers) {
+        const pctLow = getLowPercentage(multipliers);
         const warningSpan = document.getElementById('lowPercentWarning');
         if (warningSpan) {
             if (pctLow > 55) {
                 warningSpan.style.display = 'inline-block';
                 warningSpan.textContent = `📉 Tendencia Bajista (1.00-1.99 ${pctLow.toFixed(1)}% >55%)`;
-            } else { warningSpan.style.display = 'none'; }
+            } else {
+                warningSpan.style.display = 'none';
+            }
         }
-        updateAlertCircleVisibility();
+        updateAlertCircleVisibility(multipliers, currentMode === 'manual' ? manualPendingSignal : autoPendingSignal);
     }
 
-    // ================= INDICADORES TÉCNICOS =================
+    // ================= INDICADORES TÉCNICOS (independientes de datos) =================
     function calcEMA(data, period) {
         let ema = [], k = 2/(period+1);
         for(let i=0;i<data.length;i++) {
@@ -368,10 +392,14 @@
         return { soportes: soportesValidos.slice(0,2), resistencias: resistenciasValidas.slice(0,2) };
     }
 
-    function getPositions() {
+    function getPositions(sequence) {
         let pos = [0];
-        for (let i = 1; i < rawMultipliers.length; i++) {
-            if (rawMultipliers[i] >= 2.00) pos.push(pos[i-1] + 1);
+        for (let i = 1; i < sequence.length; i++) {
+            // sequence[i] es el nivel de secuencia, pero originalmente se basaba en si multiplier>=2.0.
+            // Necesitamos reconstruir a partir de los multiplicadores. Para simplificar, usaremos los multiplicadores originales.
+            // En modo automático, tenemos autoData[game] con multiplicadores, y sequence se calcula en base a ellos.
+            // Esta función se llamará con la secuencia de niveles (sequence) ya calculada.
+            if (sequence[i] > sequence[i-1]) pos.push(pos[i-1] + 1);
             else pos.push(pos[i-1] - 1);
         }
         return pos;
@@ -425,21 +453,18 @@
         return false;
     }
 
-    function detectarPatronGeneralOriginal() {
+    function detectarPatronGeneralOriginal(sequence, multipliers, signalsEnabled, lowPct, lastEMA3, lastEMA4) {
         if(!signalsEnabled) return null;
-        if(getLowPercentage() > 55) return null;
-        const seq = sequenceLevels, raw = rawMultipliers;
-        if(seq.length<5 || raw.length<5) return null;
-        const ema3 = calcEMA(seq,3), ema4_orig = calcEMA(seq,4);
+        if(lowPct > 55) return null;
+        if(sequence.length<5 || multipliers.length<5) return null;
+        const ema3 = calcEMA(sequence,3), ema4_orig = calcEMA(sequence,4);
         const cur3 = ema3[ema3.length-1], cur4 = ema4_orig[ema4_orig.length-1];
-        if(lastEMA3!==null && lastEMA4!==null && lastEMA3<lastEMA4 && cur3>cur4) {
-            lastEMA3=cur3; lastEMA4=cur4;
+        if(lastEMA3 !== null && lastEMA4 !== null && lastEMA3 < lastEMA4 && cur3 > cur4) {
             return { pattern:'EMAs 2.00x', target:2.0, title:"✅ Señal EMAs ✅", targetStr:"2.00x" };
         }
-        lastEMA3=cur3; lastEMA4=cur4;
-        const wt = calcWaveTrend(seq);
+        const wt = calcWaveTrend(sequence);
         const len = wt.wave.length;
-        if(len>1 && wt.wave[len-1]!==null && wt.signal[len-1]!==null && raw[raw.length-1]>=2.0) {
+        if(len>1 && wt.wave[len-1]!==null && wt.signal[len-1]!==null && multipliers[multipliers.length-1]>=2.0) {
             if(wt.wave[len-1] < wt.signal[len-1]) {
                 return { pattern:'WT 1.50x', target:1.5, title:"✅ Señal TW1.5 ✅", targetStr:"1.50x" };
             }
@@ -447,16 +472,15 @@
         return null;
     }
 
-    function detectarNuevasSenales() {
+    function detectarNuevasSenales(sequence, multipliers, signalsEnabled, lowPct) {
         if(!signalsEnabled) return null;
-        if(getLowPercentage() > 55) return null;
-        const positions = getPositions();
+        if(lowPct > 55) return null;
+        const positions = getPositions(sequence);
         if (positions.length < 25) return null;
-        const raw = rawMultipliers;
         if (detectarBKout150(positions)) {
             return { pattern:'BKout 1.50x', target:1.5, title:"✅ Señal BKout ✅", targetStr:"1.50x" };
         }
-        if (detectarSK200(positions, raw)) {
+        if (detectarSK200(positions, multipliers)) {
             return { pattern:'SK 2.00x', target:SK_WIN_THRESHOLD, title:"✅ Señal SK 2.0 ✅", targetStr:"1.85x" };
         }
         return null;
@@ -477,14 +501,7 @@
         circle.style.display = 'flex';
     }
 
-    function detectarPatronGeneral() {
-        let patron = detectarPatronGeneralOriginal();
-        if (patron) return patron;
-        patron = detectarNuevasSenales();
-        return patron;
-    }
-
-    function procesarIntento(multiplier) {
+    function procesarIntento(multiplier, pendingSignal, completedSignals, signalsEnabledFlag, setSignalsEnabled, updateStats, scheduleClear, setPendingSignal, setSignalStatus) {
         if(!pendingSignal) return false;
         pendingSignal.attempts++;
         pendingSignal.results.push(multiplier);
@@ -495,14 +512,15 @@
             if(acierto) {
                 alertDiv.innerHTML = `¡SE GANÓ!<br>✅ ${multiplier.toFixed(2)}x`;
                 completedSignals.push({ pattern: pendingSignal.pattern, success1: true });
-                pendingSignal = null; signalsEnabled = false;
-                document.getElementById('signalStatus').innerHTML = '---';
-                actualizarEstadisticasSenales();
-                scheduleClearMessage();
+                setPendingSignal(null);
+                setSignalsEnabled(false);
+                setSignalStatus('---');
+                updateStats();
+                scheduleClear();
                 return true;
             } else {
                 alertDiv.innerHTML = `🔔 REPETIR 🔔`;
-                document.getElementById('signalStatus').innerHTML = `${pendingSignal.displayText} (2do intento)`;
+                setSignalStatus(`${pendingSignal.displayText} (2do intento)`);
             }
         } else if(pendingSignal.attempts === 2) {
             const [r1, r2] = pendingSignal.results;
@@ -514,76 +532,257 @@
                 alertDiv.innerHTML = `PERDIDO<br>❌ ${r1.toFixed(2)}x → ${r2.toFixed(2)}x`;
                 completedSignals.push({ pattern: pendingSignal.pattern, success1: false, success2: false });
             }
-            pendingSignal = null; signalsEnabled = false;
-            document.getElementById('signalStatus').innerHTML = '---';
-            actualizarEstadisticasSenales();
-            scheduleClearMessage();
+            setPendingSignal(null);
+            setSignalsEnabled(false);
+            setSignalStatus('---');
+            updateStats();
+            scheduleClear();
         }
         return true;
     }
 
-    function addPoint(multiplier) {
+    // ================= MODO MANUAL =================
+    function actualizarEstadisticasManual() {
+        const total = manualMultipliers.length;
+        document.getElementById('totalCount').innerText = total;
+        if(total===0) {
+            ['pctLow','pctMid','pctHigh','pctJackpot'].forEach(id=>document.getElementById(id).innerText='0%');
+            updateLowPercentWarning(manualMultipliers);
+            return;
+        }
+        let low=0,mid=0,high=0,jack=0;
+        for(let m of manualMultipliers){
+            if(m<2) low++;
+            else if(m<5) mid++;
+            else if(m<10) high++;
+            else jack++;
+        }
+        document.getElementById('pctLow').innerText = ((low/total)*100).toFixed(1)+'%';
+        document.getElementById('pctMid').innerText = ((mid/total)*100).toFixed(1)+'%';
+        document.getElementById('pctHigh').innerText = ((high/total)*100).toFixed(1)+'%';
+        document.getElementById('pctJackpot').innerText = ((jack/total)*100).toFixed(1)+'%';
+        updateLowPercentWarning(manualMultipliers);
+    }
+
+    function actualizarEstadisticasSenalesManual() {
+        const stats = { 'EMAs 2.00x': { t:0, w1:0, w2:0, l:0 }, 'WT 1.50x': { t:0, w1:0, w2:0, l:0 }, 'BKout 1.50x': { t:0, w1:0, w2:0, l:0 }, 'SK 2.00x': { t:0, w1:0, w2:0, l:0 } };
+        for(let sig of manualCompletedSignals) if(stats[sig.pattern]){ stats[sig.pattern].t++; if(sig.success1 && sig.success2===undefined) stats[sig.pattern].w1++; else if(sig.success1===false && sig.success2===true) stats[sig.pattern].w2++; else if(sig.success1===false && sig.success2===false) stats[sig.pattern].l++; }
+        const body = document.getElementById('signalsStatsBody'); body.innerHTML = '';
+        for(let tipo of ['EMAs 2.00x', 'WT 1.50x', 'BKout 1.50x', 'SK 2.00x']){ const s = stats[tipo]; const total = s.t; const aciertos = s.w1 + s.w2; const pct = total ? ((aciertos/total)*100).toFixed(1) : '0'; body.insertAdjacentHTML('beforeend', `<tr><td>${tipo}</td><td>${total}</td><td>${s.w1}</td><td>${s.w2}</td><td>${aciertos}</td><td>${s.l}</td><td>${pct}%</td></tr>`); }
+    }
+
+    function addPointManual(multiplier) {
         if(!multiplier || isNaN(multiplier)) return;
         let signalProcessed = false;
-        if(pendingSignal !== null) signalProcessed = procesarIntento(multiplier);
-        rawMultipliers.push(multiplier);
-        let newLevel = sequenceLevels.length===0 ? 0 : sequenceLevels[sequenceLevels.length-1] + (multiplier>=2.0 ? 1 : -1);
-        sequenceLevels.push(newLevel);
+        if(manualPendingSignal !== null) {
+            signalProcessed = procesarIntento(multiplier, manualPendingSignal, manualCompletedSignals, true, 
+                (val) => { manualSignalsEnabled = val; }, 
+                () => actualizarEstadisticasSenalesManual(),
+                () => scheduleClearMessageManual(),
+                (val) => { manualPendingSignal = val; },
+                (txt) => { document.getElementById('signalStatus').innerHTML = txt; }
+            );
+        }
+        manualMultipliers.push(multiplier);
+        let newLevel = manualSequence.length===0 ? 0 : manualSequence[manualSequence.length-1] + (multiplier>=2.0 ? 1 : -1);
+        manualSequence.push(newLevel);
         let color = multiplier<=1.99 ? '#00cfff' : multiplier<=2.99 ? '#aa00ff' : multiplier<=4.99 ? '#006400' : multiplier<=9.99 ? '#ffff00' : '#8B0000';
-        coloresPuntos.push(color);
-        document.getElementById('seqLength').innerText = sequenceLevels.length;
-        actualizarEstadisticasCuotas();
-        actualizarGrafico();
-        actualizarBarraResultados();
-        updateLowPercentWarning();
+        manualColors.push(color);
+        document.getElementById('seqLength').innerText = manualSequence.length;
+        actualizarEstadisticasManual();
+        actualizarGraficoManual();
+        actualizarBarraResultados(manualMultipliers);
+        updateLowPercentWarning(manualMultipliers);
 
-        if(signalsEnabled && !signalProcessed) {
-            const patron = detectarPatronGeneral();
+        if(manualSignalsEnabled && !signalProcessed) {
+            const lowPct = getLowPercentage(manualMultipliers);
+            let patron = detectarPatronGeneralOriginal(manualSequence, manualMultipliers, true, lowPct, manualLastEMA3, manualLastEMA4);
+            if(!patron) patron = detectarNuevasSenales(manualSequence, manualMultipliers, true, lowPct);
             if(patron) {
-                pendingSignal = { 
+                manualPendingSignal = { 
                     pattern: patron.pattern, 
                     displayText: patron.title, 
                     target: patron.target,
                     attempts: 0, 
                     results: [] 
                 };
-                signalsEnabled = false;
+                manualSignalsEnabled = false;
                 mostrarAlertaSeñal(patron);
                 document.getElementById('signalStatus').innerHTML = patron.title;
             }
         }
-        if(rawMultipliers.length > 1000) { rawMultipliers.shift(); sequenceLevels.shift(); coloresPuntos.shift(); }
-        updateAlertCircleVisibility();
+        if(manualMultipliers.length > 1000) { manualMultipliers.shift(); manualSequence.shift(); manualColors.shift(); }
+        updateAlertCircleVisibility(manualMultipliers, manualPendingSignal);
     }
 
-    function deleteLast() { if(sequenceLevels.length===0) return; rawMultipliers.pop(); sequenceLevels.pop(); coloresPuntos.pop(); actualizarEstadisticasCuotas(); actualizarGrafico(); actualizarBarraResultados(); document.getElementById('seqLength').innerText = sequenceLevels.length; if(pendingSignal) { pendingSignal=null; signalsEnabled=true; if(clearTimer)clearTimeout(clearTimer); document.getElementById('alert-circulo').innerHTML='🛜 NEUTRAL 🛜'; document.getElementById('signalStatus').innerHTML='---'; } updateLowPercentWarning(); updateAlertCircleVisibility(); }
-    function resetTodo() { rawMultipliers = []; sequenceLevels = []; coloresPuntos = []; pendingSignal=null; signalsEnabled=true; if(clearTimer)clearTimeout(clearTimer); completedSignals = []; lastEMA3=lastEMA4=null; document.getElementById('seqLength').innerText="0"; document.getElementById('alert-circulo').innerHTML='🛜 NEUTRAL 🛜'; document.getElementById('signalStatus').innerHTML='---'; actualizarEstadisticasCuotas(); actualizarEstadisticasSenales(); actualizarGrafico(); actualizarBarraResultados(); updateLowPercentWarning(); updateAlertCircleVisibility(); }
+    function scheduleClearMessageManual() {
+        if(manualClearTimer) clearTimeout(manualClearTimer);
+        manualClearTimer = setTimeout(()=>{
+            const circle = document.getElementById('alert-circulo');
+            circle.innerHTML = '🛜 NEUTRAL 🛜';
+            circle.style.display = 'flex';
+            document.getElementById('signalStatus').innerHTML = '---';
+            manualSignalsEnabled = true;
+            manualClearTimer = null;
+            updateAlertCircleVisibility(manualMultipliers, manualPendingSignal);
+        }, 10000);
+    }
 
-    function actualizarEstadisticasCuotas() { const total = rawMultipliers.length; document.getElementById('totalCount').innerText = total; if(total===0) { ['pctLow','pctMid','pctHigh','pctJackpot'].forEach(id=>document.getElementById(id).innerText='0%'); updateLowPercentWarning(); return; } let low=0,mid=0,high=0,jack=0; for(let m of rawMultipliers){ if(m<2) low++; else if(m<5) mid++; else if(m<10) high++; else jack++; } document.getElementById('pctLow').innerText = ((low/total)*100).toFixed(1)+'%'; document.getElementById('pctMid').innerText = ((mid/total)*100).toFixed(1)+'%'; document.getElementById('pctHigh').innerText = ((high/total)*100).toFixed(1)+'%'; document.getElementById('pctJackpot').innerText = ((jack/total)*100).toFixed(1)+'%'; updateLowPercentWarning(); }
-    function actualizarEstadisticasSenales() {
+    function deleteLastManual() {
+        if(manualSequence.length===0) return;
+        manualMultipliers.pop();
+        manualSequence.pop();
+        manualColors.pop();
+        actualizarEstadisticasManual();
+        actualizarGraficoManual();
+        actualizarBarraResultados(manualMultipliers);
+        document.getElementById('seqLength').innerText = manualSequence.length;
+        if(manualPendingSignal) {
+            manualPendingSignal = null;
+            manualSignalsEnabled = true;
+            if(manualClearTimer) clearTimeout(manualClearTimer);
+            document.getElementById('alert-circulo').innerHTML = '🛜 NEUTRAL 🛜';
+            document.getElementById('signalStatus').innerHTML = '---';
+        }
+        updateLowPercentWarning(manualMultipliers);
+        updateAlertCircleVisibility(manualMultipliers, manualPendingSignal);
+    }
+
+    function resetManual() {
+        manualMultipliers = [];
+        manualSequence = [];
+        manualColors = [];
+        manualPendingSignal = null;
+        manualSignalsEnabled = true;
+        if(manualClearTimer) clearTimeout(manualClearTimer);
+        manualCompletedSignals = [];
+        manualLastEMA3 = manualLastEMA4 = null;
+        document.getElementById('seqLength').innerText = "0";
+        document.getElementById('alert-circulo').innerHTML = '🛜 NEUTRAL 🛜';
+        document.getElementById('signalStatus').innerHTML = '---';
+        actualizarEstadisticasManual();
+        actualizarEstadisticasSenalesManual();
+        actualizarGraficoManual();
+        actualizarBarraResultados(manualMultipliers);
+        updateLowPercentWarning(manualMultipliers);
+        updateAlertCircleVisibility(manualMultipliers, manualPendingSignal);
+    }
+
+    // ================= MODO AUTOMÁTICO =================
+    function getGameMultipliers() {
+        return autoData[selectedGame];
+    }
+
+    function getGameSequence() {
+        // Calcular secuencia a partir de los multiplicadores
+        const multipliers = autoData[selectedGame];
+        let seq = [];
+        for(let i=0; i<multipliers.length; i++) {
+            if(i===0) seq.push(0);
+            else seq.push(seq[i-1] + (multipliers[i] >= 2.0 ? 1 : -1));
+        }
+        return seq;
+    }
+
+    function getGameColors() {
+        return autoData[selectedGame].map(m => m<=1.99 ? '#00cfff' : m<=2.99 ? '#aa00ff' : m<=4.99 ? '#006400' : m<=9.99 ? '#ffff00' : '#8B0000');
+    }
+
+    function actualizarEstadisticasAuto() {
+        const mult = getGameMultipliers();
+        const total = mult.length;
+        document.getElementById('totalCount').innerText = total;
+        if(total===0) {
+            ['pctLow','pctMid','pctHigh','pctJackpot'].forEach(id=>document.getElementById(id).innerText='0%');
+            updateLowPercentWarning(mult);
+            return;
+        }
+        let low=0,mid=0,high=0,jack=0;
+        for(let m of mult){
+            if(m<2) low++;
+            else if(m<5) mid++;
+            else if(m<10) high++;
+            else jack++;
+        }
+        document.getElementById('pctLow').innerText = ((low/total)*100).toFixed(1)+'%';
+        document.getElementById('pctMid').innerText = ((mid/total)*100).toFixed(1)+'%';
+        document.getElementById('pctHigh').innerText = ((high/total)*100).toFixed(1)+'%';
+        document.getElementById('pctJackpot').innerText = ((jack/total)*100).toFixed(1)+'%';
+        updateLowPercentWarning(mult);
+    }
+
+    function actualizarEstadisticasSenalesAuto() {
         const stats = { 'EMAs 2.00x': { t:0, w1:0, w2:0, l:0 }, 'WT 1.50x': { t:0, w1:0, w2:0, l:0 }, 'BKout 1.50x': { t:0, w1:0, w2:0, l:0 }, 'SK 2.00x': { t:0, w1:0, w2:0, l:0 } };
-        for(let sig of completedSignals) if(stats[sig.pattern]){ stats[sig.pattern].t++; if(sig.success1 && sig.success2===undefined) stats[sig.pattern].w1++; else if(sig.success1===false && sig.success2===true) stats[sig.pattern].w2++; else if(sig.success1===false && sig.success2===false) stats[sig.pattern].l++; }
+        for(let sig of autoCompletedSignals) if(stats[sig.pattern]){ stats[sig.pattern].t++; if(sig.success1 && sig.success2===undefined) stats[sig.pattern].w1++; else if(sig.success1===false && sig.success2===true) stats[sig.pattern].w2++; else if(sig.success1===false && sig.success2===false) stats[sig.pattern].l++; }
         const body = document.getElementById('signalsStatsBody'); body.innerHTML = '';
         for(let tipo of ['EMAs 2.00x', 'WT 1.50x', 'BKout 1.50x', 'SK 2.00x']){ const s = stats[tipo]; const total = s.t; const aciertos = s.w1 + s.w2; const pct = total ? ((aciertos/total)*100).toFixed(1) : '0'; body.insertAdjacentHTML('beforeend', `<tr><td>${tipo}</td><td>${total}</td><td>${s.w1}</td><td>${s.w2}</td><td>${aciertos}</td><td>${s.l}</td><td>${pct}%</td></tr>`); }
     }
 
-    // Nuevo: Obtener niveles altos con repeticiones >=5
-    function getHighMultiplierLevels() {
-        const countsYellow = new Map();
-        const countsPink = new Map();
-        for (let m of rawMultipliers) {
-            if (m >= 5.0 && m < 10.0) { const key = m.toFixed(2); countsYellow.set(key, (countsYellow.get(key) || 0) + 1); }
-            else if (m >= 10.0) { const key = m.toFixed(2); countsPink.set(key, (countsPink.get(key) || 0) + 1); }
-        }
-        const yellowLevels = Array.from(countsYellow.entries()).filter(([_,c]) => c >= 5).map(([v,_]) => parseFloat(v)).sort((a,b)=>a-b);
-        const pinkLevels = Array.from(countsPink.entries()).filter(([_,c]) => c >= 5).map(([v,_]) => parseFloat(v)).sort((a,b)=>a-b);
-        return { yellowLevels, pinkLevels };
+    function scheduleClearMessageAuto() {
+        if(autoClearTimer) clearTimeout(autoClearTimer);
+        autoClearTimer = setTimeout(()=>{
+            const circle = document.getElementById('alert-circulo');
+            circle.innerHTML = '🛜 NEUTRAL 🛜';
+            circle.style.display = 'flex';
+            document.getElementById('signalStatus').innerHTML = '---';
+            autoSignalsEnabled = true;
+            autoClearTimer = null;
+            updateAlertCircleVisibility(getGameMultipliers(), autoPendingSignal);
+        }, 10000);
     }
 
-    function actualizarGrafico() {
+    function addPointAuto(multiplier, game) {
+        // Solo se llama cuando se recibe un nuevo evento del juego seleccionado
+        if(game !== selectedGame) return;
+        let signalProcessed = false;
+        const multipliers = autoData[selectedGame];
+        const sequence = getGameSequence(); // secuencia antes de añadir
+        if(autoPendingSignal !== null) {
+            signalProcessed = procesarIntento(multiplier, autoPendingSignal, autoCompletedSignals, true,
+                (val) => { autoSignalsEnabled = val; },
+                () => actualizarEstadisticasSenalesAuto(),
+                () => scheduleClearMessageAuto(),
+                (val) => { autoPendingSignal = val; },
+                (txt) => { document.getElementById('signalStatus').innerHTML = txt; }
+            );
+        }
+        autoData[selectedGame].push(multiplier);
+        // Recalcular secuencia y colores para el gráfico
+        const newSeq = getGameSequence();
+        const newColors = getGameColors();
+        document.getElementById('seqLength').innerText = newSeq.length;
+        actualizarEstadisticasAuto();
+        actualizarGraficoAuto();
+        actualizarBarraResultados(multipliers);
+        updateLowPercentWarning(multipliers);
+
+        if(autoSignalsEnabled && !signalProcessed) {
+            const lowPct = getLowPercentage(multipliers);
+            let patron = detectarPatronGeneralOriginal(newSeq, multipliers, true, lowPct, autoLastEMA3, autoLastEMA4);
+            if(!patron) patron = detectarNuevasSenales(newSeq, multipliers, true, lowPct);
+            if(patron) {
+                autoPendingSignal = { 
+                    pattern: patron.pattern, 
+                    displayText: patron.title, 
+                    target: patron.target,
+                    attempts: 0, 
+                    results: [] 
+                };
+                autoSignalsEnabled = false;
+                mostrarAlertaSeñal(patron);
+                document.getElementById('signalStatus').innerHTML = patron.title;
+            }
+        }
+        updateAlertCircleVisibility(multipliers, autoPendingSignal);
+    }
+
+    function actualizarGraficoAuto() {
         if(!chartInstance) return;
-        const mostrar = sequenceLevels.slice(-maxPoints);
-        const colores = coloresPuntos.slice(-maxPoints);
+        const multipliers = getGameMultipliers();
+        const sequence = getGameSequence();
+        const colors = getGameColors();
+        const mostrar = sequence.slice(-maxPoints);
+        const colores = colors.slice(-maxPoints);
         const numPuntos = mostrar.length;
         chartInstance.data.labels = mostrar.map((_,i)=> i+1);
         chartInstance.data.datasets[24].data = [...mostrar];
@@ -596,18 +795,17 @@
         chartInstance.data.datasets[24].pointBorderWidth = Math.max(1, puntoRadio * 0.3);
         chartInstance.data.datasets[24].borderWidth = lineWidth;
 
-        const full = sequenceLevels;
-        if(full.length===0){
+        if(sequence.length===0){
             for(let i=0;i<=23;i++) if(chartInstance.data.datasets[i]) chartInstance.data.datasets[i].data=[];
             chartInstance.update(); return;
         }
-        const positions = getPositions();
+        const positions = getPositions(sequence);
         const ema4 = calcEMA(positions, 4);
         const ema8 = calcEMA(positions, 8);
         const ema20 = calcEMA(positions, 20);
         const trim = (arr) => arr.slice(-maxPoints);
-        const boll = calcBollinger20(full);
-        const srAvanzado = detectarSoportesResistenciasAvanzado(full);
+        const boll = calcBollinger20(sequence);
+        const srAvanzado = detectarSoportesResistenciasAvanzado(sequence);
         
         chartInstance.data.datasets[0].data = trim(boll.upper);
         chartInstance.data.datasets[1].data = trim(boll.lower);
@@ -619,8 +817,14 @@
         if(chartInstance.data.datasets[6]) chartInstance.data.datasets[6].data = (srAvanzado.resistencias[0] ? new Array(mostrar.length).fill(srAvanzado.resistencias[0].nivel) : []);
         if(chartInstance.data.datasets[7]) chartInstance.data.datasets[7].data = (srAvanzado.resistencias[1] ? new Array(mostrar.length).fill(srAvanzado.resistencias[1].nivel) : []);
 
-        // Nuevas líneas amarillas/rosas
-        const { yellowLevels, pinkLevels } = getHighMultiplierLevels();
+        // Líneas de soporte alto (amarillo/rosa)
+        const countsYellow = new Map(), countsPink = new Map();
+        for (let m of multipliers) {
+            if (m >= 5.0 && m < 10.0) { const key = m.toFixed(2); countsYellow.set(key, (countsYellow.get(key) || 0) + 1); }
+            else if (m >= 10.0) { const key = m.toFixed(2); countsPink.set(key, (countsPink.get(key) || 0) + 1); }
+        }
+        const yellowLevels = Array.from(countsYellow.entries()).filter(([_,c]) => c >= 5).map(([v,_]) => parseFloat(v)).sort((a,b)=>a-b);
+        const pinkLevels = Array.from(countsPink.entries()).filter(([_,c]) => c >= 5).map(([v,_]) => parseFloat(v)).sort((a,b)=>a-b);
         for(let i=0; i<10; i++) {
             const ds = chartInstance.data.datasets[9 + i];
             if(i < yellowLevels.length) { ds.data = new Array(mostrar.length).fill(yellowLevels[i]); ds.hidden = false; ds.borderColor = '#ffff00'; ds.label = `Soporte 5x-9.99x (${yellowLevels[i].toFixed(2)}x)`; }
@@ -645,15 +849,108 @@
         if(toggles.ema8) chartInstance.data.datasets[3].hidden=false;
         if(toggles.ema20) chartInstance.data.datasets[8].hidden=false;
         if(toggles.srAdvanced) { for(let i=4;i<=7;i++) if(chartInstance.data.datasets[i]) chartInstance.data.datasets[i].hidden=false; }
-        // Las líneas amarillas/rosas siempre visibles si existen
         for(let i=0;i<10;i++) if(chartInstance.data.datasets[9+i] && chartInstance.data.datasets[9+i].data.length>0) chartInstance.data.datasets[9+i].hidden=false;
         for(let i=0;i<5;i++) if(chartInstance.data.datasets[19+i] && chartInstance.data.datasets[19+i].data.length>0) chartInstance.data.datasets[19+i].hidden=false;
         chartInstance.update();
     }
 
-    function actualizarBarraResultados() { const container = document.getElementById('recentResultsBar'); if (!container) return; const fixedSpan = container.querySelector('span:first-child'); Array.from(container.children).filter(c => c !== fixedSpan).forEach(b => b.remove()); [...rawMultipliers].reverse().slice(0, 70).forEach(m => { let badge = document.createElement('span'); badge.className = 'result-badge'; if (m < 2) badge.classList.add('low'); else if (m < 3) badge.classList.add('medium'); else if (m < 5) badge.classList.add('high'); else if (m < 10) badge.classList.add('very-high'); else badge.classList.add('jackpot'); badge.textContent = m.toFixed(2); container.appendChild(badge); }); let badges = Array.from(container.children).filter(c => c !== fixedSpan); while (container.scrollWidth > container.clientWidth && badges.length > 0) { badges.pop().remove(); badges = Array.from(container.children).filter(c => c !== fixedSpan); } }
+    function actualizarGraficoManual() {
+        if(!chartInstance) return;
+        const mostrar = manualSequence.slice(-maxPoints);
+        const colores = manualColors.slice(-maxPoints);
+        const numPuntos = mostrar.length;
+        chartInstance.data.labels = mostrar.map((_,i)=> i+1);
+        chartInstance.data.datasets[24].data = [...mostrar];
+        chartInstance.data.datasets[24].pointBackgroundColor = colores;
+        const canvas = document.getElementById('mainChart');
+        const anchoCanvas = canvas.clientWidth;
+        let puntoRadio = 6, lineWidth = 2.5;
+        if (numPuntos > 0 && anchoCanvas > 0) { const espaciado = anchoCanvas / numPuntos; puntoRadio = Math.min(7, Math.max(3, espaciado / 10)); lineWidth = Math.max(1.5, puntoRadio * 0.5); }
+        chartInstance.data.datasets[24].pointRadius = puntoRadio;
+        chartInstance.data.datasets[24].pointBorderWidth = Math.max(1, puntoRadio * 0.3);
+        chartInstance.data.datasets[24].borderWidth = lineWidth;
 
-    function scheduleClearMessage() { if(clearTimer) clearTimeout(clearTimer); clearTimer=setTimeout(()=>{ const circle = document.getElementById('alert-circulo'); circle.innerHTML = '🛜 NEUTRAL 🛜'; circle.style.display = 'flex'; document.getElementById('signalStatus').innerHTML = '---'; signalsEnabled = true; clearTimer = null; updateAlertCircleVisibility(); }, 10000); }
+        if(manualSequence.length===0){
+            for(let i=0;i<=23;i++) if(chartInstance.data.datasets[i]) chartInstance.data.datasets[i].data=[];
+            chartInstance.update(); return;
+        }
+        const positions = getPositions(manualSequence);
+        const ema4 = calcEMA(positions, 4);
+        const ema8 = calcEMA(positions, 8);
+        const ema20 = calcEMA(positions, 20);
+        const trim = (arr) => arr.slice(-maxPoints);
+        const boll = calcBollinger20(manualSequence);
+        const srAvanzado = detectarSoportesResistenciasAvanzado(manualSequence);
+        
+        chartInstance.data.datasets[0].data = trim(boll.upper);
+        chartInstance.data.datasets[1].data = trim(boll.lower);
+        chartInstance.data.datasets[2].data = trim(ema4);
+        chartInstance.data.datasets[3].data = trim(ema8);
+        chartInstance.data.datasets[8].data = trim(ema20);
+        if(chartInstance.data.datasets[4]) chartInstance.data.datasets[4].data = (srAvanzado.soportes[0] ? new Array(mostrar.length).fill(srAvanzado.soportes[0].nivel) : []);
+        if(chartInstance.data.datasets[5]) chartInstance.data.datasets[5].data = (srAvanzado.soportes[1] ? new Array(mostrar.length).fill(srAvanzado.soportes[1].nivel) : []);
+        if(chartInstance.data.datasets[6]) chartInstance.data.datasets[6].data = (srAvanzado.resistencias[0] ? new Array(mostrar.length).fill(srAvanzado.resistencias[0].nivel) : []);
+        if(chartInstance.data.datasets[7]) chartInstance.data.datasets[7].data = (srAvanzado.resistencias[1] ? new Array(mostrar.length).fill(srAvanzado.resistencias[1].nivel) : []);
+
+        // Líneas de soporte alto
+        const countsYellow = new Map(), countsPink = new Map();
+        for (let m of manualMultipliers) {
+            if (m >= 5.0 && m < 10.0) { const key = m.toFixed(2); countsYellow.set(key, (countsYellow.get(key) || 0) + 1); }
+            else if (m >= 10.0) { const key = m.toFixed(2); countsPink.set(key, (countsPink.get(key) || 0) + 1); }
+        }
+        const yellowLevels = Array.from(countsYellow.entries()).filter(([_,c]) => c >= 5).map(([v,_]) => parseFloat(v)).sort((a,b)=>a-b);
+        const pinkLevels = Array.from(countsPink.entries()).filter(([_,c]) => c >= 5).map(([v,_]) => parseFloat(v)).sort((a,b)=>a-b);
+        for(let i=0; i<10; i++) {
+            const ds = chartInstance.data.datasets[9 + i];
+            if(i < yellowLevels.length) { ds.data = new Array(mostrar.length).fill(yellowLevels[i]); ds.hidden = false; ds.borderColor = '#ffff00'; ds.label = `Soporte 5x-9.99x (${yellowLevels[i].toFixed(2)}x)`; }
+            else { ds.data = []; ds.hidden = true; }
+        }
+        for(let i=0; i<5; i++) {
+            const ds = chartInstance.data.datasets[19 + i];
+            if(i < pinkLevels.length) { ds.data = new Array(mostrar.length).fill(pinkLevels[i]); ds.hidden = false; ds.borderColor = '#ff69b4'; ds.label = `Soporte 10x+ (${pinkLevels[i].toFixed(2)}x)`; }
+            else { ds.data = []; ds.hidden = true; }
+        }
+
+        const toggles = {
+            boll: document.getElementById('toggleBollinger')?.checked ?? true,
+            ema4: document.getElementById('toggleEMA4')?.checked ?? true,
+            ema8: document.getElementById('toggleEMA8')?.checked ?? true,
+            ema20: document.getElementById('toggleEMA20')?.checked ?? true,
+            srAdvanced: document.getElementById('toggleSRlinesAdvanced')?.checked ?? true
+        };
+        for(let i=0;i<chartInstance.data.datasets.length;i++) if(i!==24) chartInstance.data.datasets[i].hidden = true;
+        if(toggles.boll) { chartInstance.data.datasets[0].hidden=false; chartInstance.data.datasets[1].hidden=false; }
+        if(toggles.ema4) chartInstance.data.datasets[2].hidden=false;
+        if(toggles.ema8) chartInstance.data.datasets[3].hidden=false;
+        if(toggles.ema20) chartInstance.data.datasets[8].hidden=false;
+        if(toggles.srAdvanced) { for(let i=4;i<=7;i++) if(chartInstance.data.datasets[i]) chartInstance.data.datasets[i].hidden=false; }
+        for(let i=0;i<10;i++) if(chartInstance.data.datasets[9+i] && chartInstance.data.datasets[9+i].data.length>0) chartInstance.data.datasets[9+i].hidden=false;
+        for(let i=0;i<5;i++) if(chartInstance.data.datasets[19+i] && chartInstance.data.datasets[19+i].data.length>0) chartInstance.data.datasets[19+i].hidden=false;
+        chartInstance.update();
+    }
+
+    function actualizarBarraResultados(multipliers) {
+        const container = document.getElementById('recentResultsBar');
+        if (!container) return;
+        const fixedSpan = container.querySelector('span:first-child');
+        Array.from(container.children).filter(c => c !== fixedSpan).forEach(b => b.remove());
+        [...multipliers].reverse().slice(0, 70).forEach(m => {
+            let badge = document.createElement('span');
+            badge.className = 'result-badge';
+            if (m < 2) badge.classList.add('low');
+            else if (m < 3) badge.classList.add('medium');
+            else if (m < 5) badge.classList.add('high');
+            else if (m < 10) badge.classList.add('very-high');
+            else badge.classList.add('jackpot');
+            badge.textContent = m.toFixed(2);
+            container.appendChild(badge);
+        });
+        let badges = Array.from(container.children).filter(c => c !== fixedSpan);
+        while (container.scrollWidth > container.clientWidth && badges.length > 0) {
+            badges.pop().remove();
+            badges = Array.from(container.children).filter(c => c !== fixedSpan);
+        }
+    }
 
     function initChart() {
         const ctx = document.getElementById('mainChart').getContext('2d');
@@ -677,15 +974,10 @@
         datasets.push({ label: 'WaveTrend', data: [], borderColor: '#aaffff', borderWidth: 2, pointRadius: 0, hidden: true });
         datasets.push({ label: 'WT Señal', data: [], borderColor: '#ff8888', borderWidth: 2, pointRadius: 0, hidden: true });
         chartInstance = new Chart(ctx, { type: 'line', data: { labels: [], datasets }, options: { responsive: true, maintainAspectRatio: true, animation: { duration: 200 }, scales: { y: { grid: { color: '#226622' }, title: { display: true, text: 'Nivel', color: '#ccffcc' } }, y1: { position: 'right', min: 0, max: 100, grid: { drawOnChartArea: false }, title: { text: 'RSI', color: '#ff99cc' } } }, plugins: { legend: { display: false } } } });
-        actualizarGrafico();
+        actualizarGraficoManual(); // inicial con datos vacíos
     }
 
-    // ================= WEBSOCKET (backend) =================
-    let ws = null;
-    let reconnectTimer = null;
-    let lastAutoResult = null;
-    let autoEnabled = false;
-
+    // ================= WEBSOCKET =================
     function conectarWS() {
         if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) ws.close();
         const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -693,28 +985,47 @@
         ws = new WebSocket(wsUrl);
         ws.onopen = () => {
             document.getElementById('wsStatusIcon').innerHTML = '🟢 Auto conectado';
-            autoEnabled = true;
             console.log('WebSocket conectado');
         };
         ws.onmessage = (event) => {
-            if (!modoAutomatico) return;
+            if (currentMode !== 'auto') return;
             try {
                 const data = JSON.parse(event.data);
-                // Ignorar historial inicial
-                if (data.tipo === 'historial') return;
-                // Solo procesar si el tipo coincide con el juego seleccionado
-                if (data.tipo === selectedGame && data.maxMultiplier) {
+                if (data.tipo === 'historial') {
+                    // Almacenar eventos históricos en autoData[data.api]
+                    const api = data.api;
+                    if (api && data.eventos && Array.isArray(data.eventos)) {
+                        const multipliers = data.eventos.map(e => e.maxMultiplier).filter(m => m && m > 0);
+                        autoData[api] = multipliers;
+                        // Si es el juego actual, refrescar gráfico y estadísticas
+                        if (api === selectedGame) {
+                            document.getElementById('seqLength').innerText = multipliers.length;
+                            actualizarEstadisticasAuto();
+                            actualizarGraficoAuto();
+                            actualizarBarraResultados(multipliers);
+                            updateLowPercentWarning(multipliers);
+                        }
+                    }
+                } else if (data.tipo === 'crash' || data.tipo === 'slide' || data.tipo === 'spaceman') {
+                    const game = data.tipo;
                     const mult = data.maxMultiplier;
-                    if (mult > 0 && mult !== lastAutoResult) {
-                        lastAutoResult = mult;
-                        addPoint(mult);
+                    if (mult && mult > 0) {
+                        // Guardar en autoData[game]
+                        autoData[game].push(mult);
+                        // Si es el juego seleccionado, añadir al gráfico
+                        if (game === selectedGame) {
+                            // Evitar duplicados consecutivos (por si acaso)
+                            if (mult !== lastAutoResult) {
+                                lastAutoResult = mult;
+                                addPointAuto(mult, game);
+                            }
+                        }
                     }
                 }
             } catch (err) { console.warn(err); }
         };
         ws.onclose = () => {
             document.getElementById('wsStatusIcon').innerHTML = '🔴 Reconectando...';
-            autoEnabled = false;
             if (reconnectTimer) clearTimeout(reconnectTimer);
             reconnectTimer = setTimeout(() => conectarWS(), 3000);
         };
@@ -722,29 +1033,41 @@
     }
 
     function setModo(manual) {
-        modoAutomatico = !manual;
-        const manualDiv = document.getElementById('manualControls');
-        const btnMan = document.getElementById('btnManualMode');
-        const btnAuto = document.getElementById('btnAutoMode');
-        const modeTextSpan = document.getElementById('modeText');
-        const gameGroup = document.getElementById('gameSelectorGroup');
-        if (modoAutomatico) {
-            btnMan.classList.remove('active');
-            btnAuto.classList.add('active');
-            manualDiv.classList.add('hidden-buttons');
-            modeTextSpan.innerText = 'Automático';
-            gameGroup.style.display = 'flex'; // mostrar selector de juego
-            if (!ws || ws.readyState !== WebSocket.OPEN) conectarWS();
-            else autoEnabled = true;
-        } else {
-            btnAuto.classList.remove('active');
-            btnMan.classList.add('active');
-            manualDiv.classList.remove('hidden-buttons');
-            modeTextSpan.innerText = 'Manual';
-            gameGroup.style.display = 'none'; // ocultar selector en modo manual
+        if (manual && currentMode === 'manual') return;
+        if (!manual && currentMode === 'auto') return;
+        if (manual) {
+            currentMode = 'manual';
+            document.getElementById('btnManualMode').classList.add('active');
+            document.getElementById('btnAutoMode').classList.remove('active');
+            document.getElementById('manualControls').classList.remove('hidden-buttons');
+            document.getElementById('gameSelectorGroup').style.display = 'none';
+            document.getElementById('modeText').innerText = 'Manual';
             if (ws) ws.close();
-            autoEnabled = false;
             document.getElementById('wsStatusIcon').innerHTML = '🔌 Manual';
+            // Resetear el gráfico a los datos manuales actuales (si hay)
+            actualizarGraficoManual();
+            actualizarEstadisticasManual();
+            actualizarEstadisticasSenalesManual();
+            actualizarBarraResultados(manualMultipliers);
+            document.getElementById('seqLength').innerText = manualSequence.length;
+            updateLowPercentWarning(manualMultipliers);
+            updateAlertCircleVisibility(manualMultipliers, manualPendingSignal);
+        } else {
+            currentMode = 'auto';
+            document.getElementById('btnAutoMode').classList.add('active');
+            document.getElementById('btnManualMode').classList.remove('active');
+            document.getElementById('manualControls').classList.add('hidden-buttons');
+            document.getElementById('gameSelectorGroup').style.display = 'flex';
+            document.getElementById('modeText').innerText = 'Automático';
+            conectarWS();
+            // Forzar refresco del juego actual
+            actualizarGraficoAuto();
+            actualizarEstadisticasAuto();
+            actualizarEstadisticasSenalesAuto();
+            actualizarBarraResultados(getGameMultipliers());
+            document.getElementById('seqLength').innerText = getGameMultipliers().length;
+            updateLowPercentWarning(getGameMultipliers());
+            updateAlertCircleVisibility(getGameMultipliers(), autoPendingSignal);
         }
     }
 
@@ -753,38 +1076,46 @@
         document.querySelectorAll('.game-btn').forEach(btn => btn.classList.remove('active'));
         document.getElementById(`game${game.charAt(0).toUpperCase() + game.slice(1)}`).classList.add('active');
         document.getElementById('gameActiveSpan').innerHTML = `🎮 Juego: ${game.charAt(0).toUpperCase() + game.slice(1)}`;
-        // Reiniciar el filtro de último resultado para evitar duplicados al cambiar
         lastAutoResult = null;
+        if (currentMode === 'auto') {
+            actualizarGraficoAuto();
+            actualizarEstadisticasAuto();
+            actualizarEstadisticasSenalesAuto();
+            actualizarBarraResultados(getGameMultipliers());
+            document.getElementById('seqLength').innerText = getGameMultipliers().length;
+            updateLowPercentWarning(getGameMultipliers());
+            updateAlertCircleVisibility(getGameMultipliers(), autoPendingSignal);
+        }
     }
 
+    // ================= INICIO =================
     document.addEventListener('DOMContentLoaded', () => {
         initChart();
-        setModo(true); // inicio en manual
-        setGame('crash'); // default
-        actualizarEstadisticasSenales();
+        setModo(true); // empezar en manual
+        setGame('crash');
 
-        // Eventos de modo
         document.getElementById('btnManualMode')?.addEventListener('click', () => setModo(true));
         document.getElementById('btnAutoMode')?.addEventListener('click', () => setModo(false));
-        // Eventos de juego
         document.getElementById('gameCrash')?.addEventListener('click', () => setGame('crash'));
         document.getElementById('gameSlide')?.addEventListener('click', () => setGame('slide'));
         document.getElementById('gameSpaceman')?.addEventListener('click', () => setGame('spaceman'));
 
-        document.getElementById('rangoVisual')?.addEventListener('change', (e) => { maxPoints = parseInt(e.target.value); actualizarGrafico(); });
+        document.getElementById('rangoVisual')?.addEventListener('change', (e) => { maxPoints = parseInt(e.target.value); if (currentMode === 'manual') actualizarGraficoManual(); else actualizarGraficoAuto(); });
         document.getElementById('openIndicatorBtn')?.addEventListener('click', () => document.getElementById('indicatorPanel')?.classList.add('active'));
         document.getElementById('closePanelBtn')?.addEventListener('click', () => document.getElementById('indicatorPanel')?.classList.remove('active'));
-        document.querySelectorAll('#indicatorPanel input').forEach(cb => cb.addEventListener('change', () => actualizarGrafico()));
-        document.getElementById('resetBtn')?.addEventListener('click', resetTodo);
-        document.getElementById('deleteLastBtn')?.addEventListener('click', deleteLast);
-        document.getElementById('btn1_1')?.addEventListener('click', () => { if (!modoAutomatico) addPoint(1.25); });
-        document.getElementById('btn1_2')?.addEventListener('click', () => { if (!modoAutomatico) addPoint(1.75); });
-        document.getElementById('btn2_2')?.addEventListener('click', () => { if (!modoAutomatico) addPoint(2.5); });
-        document.getElementById('btn3_3')?.addEventListener('click', () => { if (!modoAutomatico) addPoint(4.0); });
-        document.getElementById('btn4_4')?.addEventListener('click', () => { if (!modoAutomatico) addPoint(7.0); });
-        document.getElementById('btn5_5')?.addEventListener('click', () => { if (!modoAutomatico) addPoint(12.0); });
-        window.addEventListener('resize', () => { if (chartInstance) chartInstance.resize(); actualizarGrafico(); });
-        updateAlertCircleVisibility();
+        document.querySelectorAll('#indicatorPanel input').forEach(cb => cb.addEventListener('change', () => { if (currentMode === 'manual') actualizarGraficoManual(); else actualizarGraficoAuto(); }));
+
+        document.getElementById('resetBtn')?.addEventListener('click', resetManual);
+        document.getElementById('deleteLastBtn')?.addEventListener('click', deleteLastManual);
+        document.getElementById('btn1_1')?.addEventListener('click', () => { if (currentMode === 'manual') addPointManual(1.25); });
+        document.getElementById('btn1_2')?.addEventListener('click', () => { if (currentMode === 'manual') addPointManual(1.75); });
+        document.getElementById('btn2_2')?.addEventListener('click', () => { if (currentMode === 'manual') addPointManual(2.5); });
+        document.getElementById('btn3_3')?.addEventListener('click', () => { if (currentMode === 'manual') addPointManual(4.0); });
+        document.getElementById('btn4_4')?.addEventListener('click', () => { if (currentMode === 'manual') addPointManual(7.0); });
+        document.getElementById('btn5_5')?.addEventListener('click', () => { if (currentMode === 'manual') addPointManual(12.0); });
+
+        window.addEventListener('resize', () => { if (chartInstance) chartInstance.resize(); if (currentMode === 'manual') actualizarGraficoManual(); else actualizarGraficoAuto(); });
+        updateAlertCircleVisibility(manualMultipliers, manualPendingSignal);
     });
 </script>
 </body>
