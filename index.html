@@ -1,0 +1,765 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <title>Analizador de juegos de crash</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+    <style>
+        * { box-sizing: border-box; }
+        body {
+            margin: 0; padding: 0; min-height: 100vh; background: #0A0F1A;
+            position: relative; font-family: 'Segoe UI', Arial, sans-serif; color: #fff;
+            padding-bottom: 20px; overflow-x: hidden;
+        }
+        body::before {
+            content: ''; position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+            background-image: radial-gradient(2px 2px at 20px 30px, #a0c4ff, rgba(0,0,0,0)),
+                radial-gradient(2px 2px at 40px 70px, #b0d4ff, rgba(0,0,0,0)),
+                radial-gradient(2px 2px at 50px 160px, #90b0e0, rgba(0,0,0,0)),
+                radial-gradient(2px 2px at 90px 40px, #c0e0ff, rgba(0,0,0,0)),
+                radial-gradient(2px 2px at 130px 80px, #aaccff, rgba(0,0,0,0)),
+                radial-gradient(2px 2px at 160px 120px, #80a0d0, rgba(0,0,0,0));
+            background-repeat: repeat; background-size: 200px 200px;
+            animation: stars 4s linear infinite; opacity: 0.5; z-index: -2; pointer-events: none;
+        }
+        body::after {
+            content: ''; position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+            background: radial-gradient(circle at 30% 50%, rgba(80,120,255,0.25), transparent 50%),
+                        radial-gradient(circle at 70% 50%, rgba(180,80,255,0.25), transparent 50%),
+                        radial-gradient(circle at 50% 50%, rgba(255,80,160,0.2), transparent 50%);
+            filter: blur(30px); animation: nebula 15s ease infinite; z-index: -1; opacity: 0.7; pointer-events: none;
+        }
+        @keyframes stars { from { transform: translateY(0); } to { transform: translateY(-200px); } }
+        @keyframes nebula { 0%,100%{ transform: scale(1); } 50%{ transform: scale(1.1); } }
+
+        h1, .top-bar, .recent-results, .graph-container, .stats-mini, .manual-buttons, .stats-section, .status-ws { position: relative; z-index: 1; }
+        h1 { text-align: center; color: #00ff88; font-size: 1.6rem; margin: 8px 0 4px; text-shadow: 0 0 8px #00aa44; }
+
+        .top-bar { display: flex; flex-wrap: wrap; justify-content: center; gap: 8px; margin: 5px 8px; align-items: center; }
+        .mode-group, .range-group, .indicator-group {
+            background: rgba(20,30,45,0.85); backdrop-filter: blur(8px); padding: 3px 12px;
+            border-radius: 32px; border: 1px solid #2ecc71; display: flex; gap: 8px;
+        }
+        .mode-btn { background: #2c3e2c; border: none; padding: 4px 14px; border-radius: 32px; color: white; font-weight: bold; font-size: 0.85rem; cursor: pointer; transition: 0.2s; }
+        .mode-btn.active { background: #00aa55; box-shadow: 0 0 8px #00ff88; }
+        select { background: #1f4f1f; color: white; border: none; padding: 4px 10px; border-radius: 28px; font-weight: bold; font-size: 0.85rem; }
+        button { cursor: pointer; transition: 0.2s; }
+        button:hover { transform: scale(1.02); filter: brightness(1.05); }
+
+        .recent-results {
+            background: rgba(15,25,40,0.85); backdrop-filter: blur(8px); margin: 4px 15px; border-radius: 24px;
+            padding: 6px 10px; border: 1px solid #2ecc71; display: flex; flex-wrap: nowrap; overflow-x: auto; gap: 6px; align-items: center; font-family: monospace;
+        }
+        .result-badge { display: inline-block; padding: 3px 10px; border-radius: 32px; font-weight: bold; font-size: 0.85rem; background: #1a2a1a; box-shadow: 0 0 4px #00aa44; white-space: nowrap; flex-shrink: 0; }
+        .result-badge.low { background: #00cfff; color: #000; }
+        .result-badge.medium { background: #aa00ff; }
+        .result-badge.high { background: #006400; }
+        .result-badge.very-high { background: #ffff00; color: #000; }
+        .result-badge.jackpot { background: #8B0000; }
+
+        .graph-container { position: relative; margin: 8px 15px; background: rgba(10,20,30,0.75); backdrop-filter: blur(4px); border-radius: 24px; padding: 6px; box-shadow: 0 0 20px rgba(0,170,85,0.3); }
+        canvas { width: 100%; height: auto; max-height: 78vh; background: rgba(0,0,0,0.4); border-radius: 18px; }
+        #alert-circulo {
+            position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%);
+            width: min(200px, 30vw); height: min(200px, 30vw); border-radius: 50%;
+            border: 2px solid #00ffaa; background: rgba(0,20,0,0.85); backdrop-filter: blur(12px);
+            box-shadow: 0 0 15px #aa66ff88; display: flex; align-items: center; justify-content: center;
+            text-align: center; font-weight: bold; font-size: clamp(11px, 3vw, 14px); color: #00ff88;
+            animation: parpadeo 1s infinite; z-index: 20; pointer-events: none; flex-direction: column;
+            gap: 8px; padding: 12px; word-break: break-word;
+        }
+        #alert-circulo .target-multiplier { font-size: 1.6rem; font-weight: 800; line-height: 1.2; margin: 4px 0; }
+        @keyframes parpadeo { 0%,100%{ opacity:1; } 50%{ opacity:0.7; } }
+
+        .manual-buttons { display: grid; grid-template-columns: repeat(8, auto); justify-content: center; gap: 8px; margin: 8px 15px 5px; overflow-x: auto; white-space: nowrap; }
+        .manual-buttons button.valor-low { background: #00a6c4; color: black; }
+        .manual-buttons button.valor-midlow { background: #33aaff; color: black; }
+        .manual-buttons button.valor-mid { background: #aa44ff; color: white; }
+        .manual-buttons button.valor-high { background: #006400; color: white; }
+        .manual-buttons button.valor-very-high { background: #ffff00; color: #1a2a0a; }
+        .manual-buttons button.valor-jackpot { background: #8B0000; color: white; }
+        .manual-buttons button.btn-reset { background: #335533; border: 1px solid #88ff88; color: white; }
+        .manual-buttons button { padding: 6px 12px; border-radius: 32px; font-weight: bold; border: none; font-size: 0.75rem; white-space: nowrap; cursor: pointer; transition: all 0.2s ease; }
+        @media (max-width: 800px) {
+            .manual-buttons { grid-template-columns: repeat(4, 1fr); gap: 8px; white-space: normal; }
+            .manual-buttons button { width: 100%; text-align: center; padding: 8px 4px; font-size: 0.75rem; }
+        }
+        @media (max-width: 550px) { .manual-buttons button { padding: 6px 3px; font-size: 0.7rem; } }
+        @media (max-width: 450px) { .manual-buttons button { padding: 5px 2px; font-size: 0.65rem; } }
+        .hidden-buttons { display: none !important; }
+
+        .status-ws { position: fixed; bottom: 10px; right: 12px; background: rgba(15,30,45,0.85); backdrop-filter: blur(4px); padding: 3px 10px; border-radius: 32px; font-size: 10px; font-family: monospace; z-index: 99; border-left: 3px solid #2eff8e; }
+
+        .indicator-panel {
+            position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%);
+            background: rgba(10,20,35,0.96); backdrop-filter: blur(16px); border: 2px solid #88ff88;
+            border-radius: 28px; width: 360px; padding: 14px 16px; z-index: 300; display: none; box-shadow: 0 0 35px #00aa55;
+        }
+        .indicator-panel.active { display: block; }
+        .indicator-panel h3 { margin: 0 0 10px 0; font-size: 1.2rem; text-align: center; color: #aaffaa; }
+        .indicator-item { display: flex; justify-content: space-between; align-items: center; padding: 6px 4px; border-bottom: 1px solid #3a7a3a; font-size: 0.85rem; }
+        .indicator-item label { display: flex; gap: 10px; align-items: center; font-weight: 600; }
+        .line-style { display: inline-block; width: 24px; height: 12px; border-radius: 4px; margin-left: 8px; vertical-align: middle; }
+        .line-style.solid { background: currentColor; height: 3px; width: 20px; margin-top: 4px; }
+        .line-style.dashed { background: none; border-top: 2px dashed currentColor; width: 20px; height: 2px; }
+        .close-panel-btn { background: #8b3c2c; width: 100%; margin-top: 12px; padding: 6px; border-radius: 32px; border: none; color: white; font-weight: bold; }
+
+        .stats-section { display: flex; flex-wrap: wrap; gap: 16px; margin: 10px 15px; align-items: stretch; }
+        .stats-a, .stats-b { background: rgba(15,25,45,0.85); backdrop-filter: blur(8px); border-radius: 20px; padding: 12px; border: 1px solid #2ecc71; flex: 1; min-width: 280px; }
+        .stats-a h3, .stats-b h3 { margin: 0 0 8px 0; font-size: 1rem; text-align: center; color: #88ff88; }
+        .total-count { text-align: center; font-size: 1.1rem; font-weight: bold; background: #1f3a1f; padding: 4px; border-radius: 32px; margin-bottom: 8px; }
+        .rectangles { display: flex; justify-content: space-between; gap: 10px; margin-bottom: 6px; }
+        .rect { flex:1; text-align: center; padding: 6px; border-radius: 18px; font-weight: bold; background: #2c2c2c; font-size: 0.8rem; }
+        .rect.red { background: #cc3333; color: white; }
+        .rect.green { background: #33cc33; color: black; }
+        .rect.yellow { background: #ffcc00; color: black; }
+        .rect.pink { background: #ff66cc; color: black; }
+        .rect .percentage { font-size: 1rem; font-weight: bold; margin-top: 2px; }
+        .stats-b table { width: 100%; border-collapse: collapse; font-size: 11px; }
+        .stats-b th, .stats-b td { border: 1px solid #2e8b57; padding: 4px 2px; text-align: center; }
+        .stats-mini { background: rgba(15,25,40,0.85); backdrop-filter: blur(4px); margin: 4px 15px 6px; border-radius: 20px; padding: 4px 10px; display: flex; justify-content: space-between; font-size: 11px; flex-wrap: wrap; gap: 6px; }
+    </style>
+</head>
+<body>
+
+<div class="top-bar">
+    <div class="mode-group">
+        <button id="btnManualMode" class="mode-btn active">Manual</button>
+        <button id="btnAutoMode" class="mode-btn">Auto</button>
+    </div>
+    <div class="range-group">
+        <select id="rangoVisual">
+            <option value="30">30</option><option value="50">50</option><option value="75">75</option>
+            <option value="100">100</option><option value="150">150</option><option value="200">200</option><option value="300" selected>300</option>
+        </select>
+    </div>
+    <div class="indicator-group">
+        <button id="openIndicatorBtn">Config.</button>
+    </div>
+</div>
+
+<div class="recent-results" id="recentResultsBar"><span style="opacity:0.7;"></span></div>
+
+<div class="graph-container" style="position:relative;">
+    <canvas id="mainChart" width="1000" height="460"></canvas>
+    <div id="alert-circulo">🛜 NEUTRAL 🛜</div>
+</div>
+
+<div class="stats-mini">
+    <span>🎯 Señal actual: <span id="signalStatus">---</span></span>
+    <span>📈 Secuencia: <span id="seqLength">0</span></span>
+    <span>⚡ Modo: <span id="modeText">Manual</span></span>
+    <span id="lowPercentWarning" style="display: none;">⚠️ Tendencia Bajista</span>
+</div>
+
+<div id="manualControls" class="manual-buttons">
+    <button class="valor-low" id="btn1_1">1.00-1.49</button>
+    <button class="valor-midlow" id="btn1_2">1.50-1.99</button>
+    <button class="valor-mid" id="btn2_2">2.00-2.99</button>
+    <button class="valor-high" id="btn3_3">3.00-4.99</button>
+    <button class="valor-very-high" id="btn4_4">5.00-9.99</button>
+    <button class="valor-jackpot" id="btn5_5">10.00+</button>
+    <button class="btn-reset" id="resetBtn">Resetear</button>
+    <button class="btn-reset" id="deleteLastBtn">Borrar</button>
+</div>
+
+<div class="stats-section">
+    <div class="stats-a">
+        <h3>📊 Estadísticas de Cuotas</h3>
+        <div class="total-count" id="totalCount">0</div>
+        <div class="rectangles">
+            <div class="rect red">1.00 - 1.99<br><span class="percentage" id="pctLow">0%</span></div>
+            <div class="rect green">2.00 - 4.99<br><span class="percentage" id="pctMid">0%</span></div>
+        </div>
+        <div class="rectangles">
+            <div class="rect yellow">5.00 - 9.99<br><span class="percentage" id="pctHigh">0%</span></div>
+            <div class="rect pink">10.00+<br><span class="percentage" id="pctJackpot">0%</span></div>
+        </div>
+    </div>
+    <div class="stats-b">
+        <h3>📈 Estadísticas de Señales</h3>
+        <div style="overflow-x: auto;">
+            <table id="signalsStatsTable">
+                <thead><tr><th>Tipos de señales</th><th>T</th><th>W1</th><th>W2</th><th>WTs</th><th>L</th><th>Efic. %</th></tr></thead>
+                <tbody id="signalsStatsBody"></tbody>
+            </table>
+        </div>
+    </div>
+</div>
+
+<div class="status-ws" id="wsStatusIcon">🔌 Desconectado</div>
+
+<div id="indicatorPanel" class="indicator-panel">
+    <h3>VISUALIZACIÓN</h3>
+    <div class="indicator-item"><label><input type="checkbox" id="toggleBollinger" checked> Bandas Bollinger (20) <span class="line-style dashed" style="border-color:#cc77ff;"></span></label></div>
+    <div class="indicator-item"><label><input type="checkbox" id="toggleEMA4" checked> EMA 4 (cyan) <span class="line-style solid" style="background:#00ffff;"></span></label></div>
+    <div class="indicator-item"><label><input type="checkbox" id="toggleEMA8" checked> EMA 8 (amarillo) <span class="line-style solid" style="background:#ffff00;"></span></label></div>
+    <div class="indicator-item"><label><input type="checkbox" id="toggleEMA20" checked> EMA 20 (naranja) <span class="line-style solid" style="background:#ff8800;"></span></label></div>
+    <div class="indicator-item"><label><input type="checkbox" id="toggleSRlinesAdvanced" checked> Soportes/Resistencias (avanzado) <span class="line-style solid" style="background:#2ecc71;"></span><span class="line-style solid" style="background:#ff4444;"></span></label></div>
+    <button id="closePanelBtn" class="close-panel-btn">Cerrar</button>
+</div>
+
+<script>
+    // ======================== GLOBALES ========================
+    let rawMultipliers = [];
+    let sequenceLevels = [];
+    let coloresPuntos = [];
+    let maxPoints = 300;
+    let modoAutomatico = false;
+    let chartInstance = null;
+    let signalsEnabled = true;
+    let clearTimer = null;
+    
+    let pendingSignal = null;
+    let completedSignals = [];
+    
+    let lastEMA3 = null, lastEMA4 = null;
+    const SK_WIN_THRESHOLD = 1.85;
+    
+    function getLowPercentage() {
+        const total = rawMultipliers.length;
+        if (total === 0) return 0;
+        return (rawMultipliers.filter(m => m < 2.0).length / total) * 100;
+    }
+
+    function updateAlertCircleVisibility() {
+        const circle = document.getElementById('alert-circulo');
+        if (!circle) return;
+        const lowPct = getLowPercentage();
+        const isNeutral = circle.innerHTML.includes('🛜 NEUTRAL 🛜');
+        const hasActiveSignal = (pendingSignal !== null) || !isNeutral;
+        if (hasActiveSignal) circle.style.display = 'flex';
+        else if (lowPct > 55) circle.style.display = 'none';
+        else circle.style.display = 'flex';
+    }
+
+    function updateLowPercentWarning() {
+        const pctLow = getLowPercentage();
+        const warningSpan = document.getElementById('lowPercentWarning');
+        if (warningSpan) {
+            if (pctLow > 55) {
+                warningSpan.style.display = 'inline-block';
+                warningSpan.textContent = `📉 Tendencia Bajista (1.00-1.99 ${pctLow.toFixed(1)}% >55%)`;
+            } else { warningSpan.style.display = 'none'; }
+        }
+        updateAlertCircleVisibility();
+    }
+
+    // ================= INDICADORES TÉCNICOS =================
+    function calcEMA(data, period) {
+        let ema = [], k = 2/(period+1);
+        for(let i=0;i<data.length;i++) {
+            if(i===0) ema.push(data[0]);
+            else ema.push(data[i]*k + ema[i-1]*(1-k));
+        }
+        return ema;
+    }
+    function calcBollinger20(data) {
+        let period = 20, upper = [], lower = [];
+        for(let i=0;i<data.length;i++) {
+            if(i < period-1) { upper.push(null); lower.push(null); continue; }
+            let slice = data.slice(i-period+1, i+1);
+            let mean = slice.reduce((a,b)=>a+b,0)/period;
+            let variance = slice.reduce((a,b)=>a+Math.pow(b-mean,2),0)/period;
+            let std = Math.sqrt(variance);
+            upper.push(mean + 2*std);
+            lower.push(mean - 2*std);
+        }
+        return { upper, lower };
+    }
+    function calcRSI(data, period=14) {
+        let rsi = [];
+        for(let i=0;i<data.length;i++) {
+            if(i<period) { rsi.push(null); continue; }
+            let gains=0, losses=0;
+            for(let j=i-period+1;j<=i;j++) {
+                let diff = data[j]-data[j-1];
+                if(diff>0) gains+=diff;
+                else losses-=diff;
+            }
+            let rs = gains/(losses||1);
+            rsi.push(100 - 100/(1+rs));
+        }
+        return rsi;
+    }
+    function calcMACD(data, short=12, long=26, signal=9) {
+        let emaS = calcEMA(data, short);
+        let emaL = calcEMA(data, long);
+        let macdLine = emaS.map((v,i)=> v - (emaL[i]||0));
+        let signalLine = calcEMA(macdLine, signal);
+        return { macdLine, signalLine };
+    }
+    function calcWaveTrend(data, channel=10, avg=21) {
+        if(data.length < channel) return { wave: [], signal: [] };
+        let esa=[], d=[], ci=[], tci=[], wt=[], wtSig=[];
+        for(let i=0;i<data.length;i++) {
+            if(i===0) esa.push(data[0]);
+            else esa.push((data[i] + (channel-1)*esa[i-1])/channel);
+        }
+        for(let i=0;i<data.length;i++) d.push(data[i]-esa[i]);
+        for(let i=0;i<data.length;i++) {
+            let start = Math.max(0,i-channel+1);
+            let sum=0;
+            for(let k=start;k<=i;k++) sum+=d[k];
+            ci.push(sum/channel);
+            tci.push(ci[i]);
+        }
+        for(let i=0;i<data.length;i++) {
+            if(i<avg) { wt.push(null); wtSig.push(null); }
+            else {
+                let sumTci = 0;
+                for(let j=i-avg+1;j<=i;j++) sumTci+=tci[j];
+                let avgVal = sumTci/avg;
+                wt.push(avgVal);
+                wtSig.push(wt[i-1]||0);
+            }
+        }
+        return { wave: wt, signal: wtSig };
+    }
+
+    function detectarSoportesResistenciasAvanzado(sequence) {
+        if (sequence.length < 30) return { soportes: [], resistencias: [] };
+        const soportes = [], resistencias = [];
+        const tolerancia = 0.5;
+        const minRebotes = 2;
+
+        for (let i = 5; i < sequence.length - 5; i++) {
+            let esMinimo = true;
+            for (let j = i-5; j <= i+5; j++) {
+                if (j === i) continue;
+                if (sequence[j] <= sequence[i]) { esMinimo = false; break; }
+            }
+            if (esMinimo) {
+                const nivel = sequence[i];
+                const fuerza = Math.abs(sequence[i-1]-sequence[i]) + Math.abs(sequence[i+1]-sequence[i]);
+                const existe = soportes.find(s => Math.abs(s.nivel - nivel) <= tolerancia);
+                if (existe) { existe.rebotes++; existe.fuerzaTotal += fuerza; existe.ultimosIndices.push(i); if (nivel > existe.nivel) existe.nivel = nivel; }
+                else soportes.push({ nivel, rebotes: 1, fuerzaTotal: fuerza, ultimosIndices: [i], esFuerte: false });
+            }
+        }
+        for (let i = 5; i < sequence.length - 5; i++) {
+            let esMaximo = true;
+            for (let j = i-5; j <= i+5; j++) {
+                if (j === i) continue;
+                if (sequence[j] >= sequence[i]) { esMaximo = false; break; }
+            }
+            if (esMaximo) {
+                const nivel = sequence[i];
+                const fuerza = Math.abs(sequence[i-1]-sequence[i]) + Math.abs(sequence[i+1]-sequence[i]);
+                const existe = resistencias.find(r => Math.abs(r.nivel - nivel) <= tolerancia);
+                if (existe) { existe.rebotes++; existe.fuerzaTotal += fuerza; existe.ultimosIndices.push(i); if (nivel < existe.nivel) existe.nivel = nivel; }
+                else resistencias.push({ nivel, rebotes: 1, fuerzaTotal: fuerza, ultimosIndices: [i], esFuerte: false });
+            }
+        }
+        const soportesValidos = soportes.filter(s => s.rebotes >= minRebotes);
+        const resistenciasValidas = resistencias.filter(r => r.rebotes >= minRebotes);
+        soportesValidos.forEach(s => { if (s.rebotes >= 3 || s.fuerzaTotal >= 4) s.esFuerte = true; });
+        resistenciasValidas.forEach(r => { if (r.rebotes >= 3 || r.fuerzaTotal >= 4) r.esFuerte = true; });
+        soportesValidos.sort((a,b) => (b.ultimosIndices[b.ultimosIndices.length-1] - a.ultimosIndices[a.ultimosIndices.length-1]) || (b.fuerzaTotal - a.fuerzaTotal));
+        resistenciasValidas.sort((a,b) => (b.ultimosIndices[b.ultimosIndices.length-1] - a.ultimosIndices[a.ultimosIndices.length-1]) || (b.fuerzaTotal - a.fuerzaTotal));
+        return { soportes: soportesValidos.slice(0,2), resistencias: resistenciasValidas.slice(0,2) };
+    }
+
+    function getPositions() {
+        let pos = [0];
+        for (let i = 1; i < rawMultipliers.length; i++) {
+            if (rawMultipliers[i] >= 2.00) pos.push(pos[i-1] + 1);
+            else pos.push(pos[i-1] - 1);
+        }
+        return pos;
+    }
+
+    function getUltimoSoporte(positions) {
+        if (positions.length < 20) return null;
+        return Math.min(...positions.slice(-20));
+    }
+
+    function detectarBKout150(positions) {
+        if (positions.length < 25) return false;
+        const ema4 = calcEMA(positions, 4);
+        const ema8 = calcEMA(positions, 8);
+        const ema20 = calcEMA(positions, 20);
+        if (ema4.length < 2 || ema8.length < 2 || ema20.length < 2) return false;
+        const prev4 = ema4[ema4.length-2], curr4 = ema4[ema4.length-1];
+        const prev8 = ema8[ema8.length-2], curr8 = ema8[ema8.length-1];
+        if (prev4 <= prev8 && curr4 > curr8) return true;
+        const soporte = getUltimoSoporte(positions);
+        if (soporte !== null && Math.abs(positions[positions.length-1] - soporte) <= 0.5) {
+            const ultimoPos = positions[positions.length-1];
+            const ema4act = ema4[ema4.length-1];
+            const ema8act = ema8[ema8.length-1];
+            const ema20act = ema20[ema20.length-1];
+            if (ultimoPos > ema4act && ultimoPos > ema8act && ultimoPos > ema20act) return true;
+        }
+        return false;
+    }
+
+    function detectarSK200(positions, raw) {
+        if (positions.length < 25) return false;
+        const ema4 = calcEMA(positions, 4);
+        const ema8 = calcEMA(positions, 8);
+        const ema20 = calcEMA(positions, 20);
+        if (ema4.length < 2 || ema8.length < 2 || ema20.length < 2) return false;
+        const prev4 = ema4[ema4.length-2], curr4 = ema4[ema4.length-1];
+        const prev20 = ema20[ema20.length-2], curr20 = ema20[ema20.length-1];
+        const prev8 = ema8[ema8.length-2], curr8 = ema8[ema8.length-1];
+        if (prev4 <= prev20 && curr4 > curr20) return true;
+        if (raw.length >= 3) {
+            const a = raw[raw.length-1], b = raw[raw.length-2], c = raw[raw.length-3];
+            if (a >= 2.00 && b >= 2.00 && c < 2.00) return true;
+        }
+        if (prev8 <= prev20 && curr8 > curr20) return true;
+        const ultimoPos = positions[positions.length-1];
+        const ema4act = ema4[ema4.length-1];
+        const ema8act = ema8[ema8.length-1];
+        const ema20act = ema20[ema20.length-1];
+        if (Math.abs(ultimoPos - ema4act) <= 0.5 && ultimoPos > ema8act && ultimoPos > ema20act) return true;
+        return false;
+    }
+
+    function detectarPatronGeneralOriginal() {
+        if(!signalsEnabled) return null;
+        if(getLowPercentage() > 55) return null;
+        const seq = sequenceLevels, raw = rawMultipliers;
+        if(seq.length<5 || raw.length<5) return null;
+        const ema3 = calcEMA(seq,3), ema4_orig = calcEMA(seq,4);
+        const cur3 = ema3[ema3.length-1], cur4 = ema4_orig[ema4_orig.length-1];
+        if(lastEMA3!==null && lastEMA4!==null && lastEMA3<lastEMA4 && cur3>cur4) {
+            lastEMA3=cur3; lastEMA4=cur4;
+            return { pattern:'EMAs 2.00x', target:2.0, title:"✅ Señal EMAs ✅", targetStr:"2.00x" };
+        }
+        lastEMA3=cur3; lastEMA4=cur4;
+        const wt = calcWaveTrend(seq);
+        const len = wt.wave.length;
+        if(len>1 && wt.wave[len-1]!==null && wt.signal[len-1]!==null && raw[raw.length-1]>=2.0) {
+            if(wt.wave[len-1] < wt.signal[len-1]) {
+                return { pattern:'WT 1.50x', target:1.5, title:"✅ Señal TW1.5 ✅", targetStr:"1.50x" };
+            }
+        }
+        return null;
+    }
+
+    function detectarNuevasSenales() {
+        if(!signalsEnabled) return null;
+        if(getLowPercentage() > 55) return null;
+        const positions = getPositions();
+        if (positions.length < 25) return null;
+        const raw = rawMultipliers;
+        if (detectarBKout150(positions)) {
+            return { pattern:'BKout 1.50x', target:1.5, title:"✅ Señal BKout ✅", targetStr:"1.50x" };
+        }
+        if (detectarSK200(positions, raw)) {
+            return { pattern:'SK 2.00x', target:SK_WIN_THRESHOLD, title:"✅ Señal SK 2.0 ✅", targetStr:"1.85x" };
+        }
+        return null;
+    }
+
+    function getSignalDisplay(patron) {
+        if (patron.pattern === 'EMAs 2.00x') return { title: "✅ Señal EMAs ✅", target: "2.00x" };
+        if (patron.pattern === 'WT 1.50x') return { title: "✅ Señal TW1.5 ✅", target: "1.50x" };
+        if (patron.pattern === 'BKout 1.50x') return { title: "✅ Señal BKout ✅", target: "1.50x" };
+        if (patron.pattern === 'SK 2.00x') return { title: "✅ Señal SK 2.0 ✅", target: "1.85x" };
+        return { title: "🔔 Señal", target: "2.00x" };
+    }
+
+    function mostrarAlertaSeñal(patron) {
+        const disp = getSignalDisplay(patron);
+        const circle = document.getElementById('alert-circulo');
+        circle.innerHTML = `<div>${disp.title}</div><div class="target-multiplier">${disp.target}</div><div>Max 1 Gale</div>`;
+        circle.style.display = 'flex';
+    }
+
+    function detectarPatronGeneral() {
+        let patron = detectarPatronGeneralOriginal();
+        if (patron) return patron;
+        patron = detectarNuevasSenales();
+        return patron;
+    }
+
+    function procesarIntento(multiplier) {
+        if(!pendingSignal) return false;
+        pendingSignal.attempts++;
+        pendingSignal.results.push(multiplier);
+        let objetivo = pendingSignal.target;
+        let acierto = (multiplier >= objetivo);
+        const alertDiv = document.getElementById('alert-circulo');
+        if(pendingSignal.attempts === 1) {
+            if(acierto) {
+                alertDiv.innerHTML = `¡SE GANÓ!<br>✅ ${multiplier.toFixed(2)}x`;
+                completedSignals.push({ pattern: pendingSignal.pattern, success1: true });
+                pendingSignal = null; signalsEnabled = false;
+                document.getElementById('signalStatus').innerHTML = '---';
+                actualizarEstadisticasSenales();
+                scheduleClearMessage();
+                return true;
+            } else {
+                alertDiv.innerHTML = `🔔 REPETIR 🔔`;
+                document.getElementById('signalStatus').innerHTML = `${pendingSignal.displayText} (2do intento)`;
+            }
+        } else if(pendingSignal.attempts === 2) {
+            const [r1, r2] = pendingSignal.results;
+            const a2 = (r2 >= objetivo);
+            if(a2) {
+                alertDiv.innerHTML = `¡SE GANÓ!<br>✅ ${r1.toFixed(2)}x → ${r2.toFixed(2)}x`;
+                completedSignals.push({ pattern: pendingSignal.pattern, success1: false, success2: true });
+            } else {
+                alertDiv.innerHTML = `PERDIDO<br>❌ ${r1.toFixed(2)}x → ${r2.toFixed(2)}x`;
+                completedSignals.push({ pattern: pendingSignal.pattern, success1: false, success2: false });
+            }
+            pendingSignal = null; signalsEnabled = false;
+            document.getElementById('signalStatus').innerHTML = '---';
+            actualizarEstadisticasSenales();
+            scheduleClearMessage();
+        }
+        return true;
+    }
+
+    function addPoint(multiplier) {
+        if(!multiplier || isNaN(multiplier)) return;
+        let signalProcessed = false;
+        if(pendingSignal !== null) signalProcessed = procesarIntento(multiplier);
+        rawMultipliers.push(multiplier);
+        let newLevel = sequenceLevels.length===0 ? 0 : sequenceLevels[sequenceLevels.length-1] + (multiplier>=2.0 ? 1 : -1);
+        sequenceLevels.push(newLevel);
+        let color = multiplier<=1.99 ? '#00cfff' : multiplier<=2.99 ? '#aa00ff' : multiplier<=4.99 ? '#006400' : multiplier<=9.99 ? '#ffff00' : '#8B0000';
+        coloresPuntos.push(color);
+        document.getElementById('seqLength').innerText = sequenceLevels.length;
+        actualizarEstadisticasCuotas();
+        actualizarGrafico();
+        actualizarBarraResultados();
+        updateLowPercentWarning();
+
+        if(signalsEnabled && !signalProcessed) {
+            const patron = detectarPatronGeneral();
+            if(patron) {
+                pendingSignal = { 
+                    pattern: patron.pattern, 
+                    displayText: patron.title, 
+                    target: patron.target,
+                    attempts: 0, 
+                    results: [] 
+                };
+                signalsEnabled = false;
+                mostrarAlertaSeñal(patron);
+                document.getElementById('signalStatus').innerHTML = patron.title;
+            }
+        }
+        if(rawMultipliers.length > 1000) { rawMultipliers.shift(); sequenceLevels.shift(); coloresPuntos.shift(); }
+        updateAlertCircleVisibility();
+    }
+
+    function deleteLast() { if(sequenceLevels.length===0) return; rawMultipliers.pop(); sequenceLevels.pop(); coloresPuntos.pop(); actualizarEstadisticasCuotas(); actualizarGrafico(); actualizarBarraResultados(); document.getElementById('seqLength').innerText = sequenceLevels.length; if(pendingSignal) { pendingSignal=null; signalsEnabled=true; if(clearTimer)clearTimeout(clearTimer); document.getElementById('alert-circulo').innerHTML='🛜 NEUTRAL 🛜'; document.getElementById('signalStatus').innerHTML='---'; } updateLowPercentWarning(); updateAlertCircleVisibility(); }
+    function resetTodo() { rawMultipliers = []; sequenceLevels = []; coloresPuntos = []; pendingSignal=null; signalsEnabled=true; if(clearTimer)clearTimeout(clearTimer); completedSignals = []; lastEMA3=lastEMA4=null; document.getElementById('seqLength').innerText="0"; document.getElementById('alert-circulo').innerHTML='🛜 NEUTRAL 🛜'; document.getElementById('signalStatus').innerHTML='---'; actualizarEstadisticasCuotas(); actualizarEstadisticasSenales(); actualizarGrafico(); actualizarBarraResultados(); updateLowPercentWarning(); updateAlertCircleVisibility(); }
+
+    function actualizarEstadisticasCuotas() { const total = rawMultipliers.length; document.getElementById('totalCount').innerText = total; if(total===0) { ['pctLow','pctMid','pctHigh','pctJackpot'].forEach(id=>document.getElementById(id).innerText='0%'); updateLowPercentWarning(); return; } let low=0,mid=0,high=0,jack=0; for(let m of rawMultipliers){ if(m<2) low++; else if(m<5) mid++; else if(m<10) high++; else jack++; } document.getElementById('pctLow').innerText = ((low/total)*100).toFixed(1)+'%'; document.getElementById('pctMid').innerText = ((mid/total)*100).toFixed(1)+'%'; document.getElementById('pctHigh').innerText = ((high/total)*100).toFixed(1)+'%'; document.getElementById('pctJackpot').innerText = ((jack/total)*100).toFixed(1)+'%'; updateLowPercentWarning(); }
+    function actualizarEstadisticasSenales() {
+        const stats = { 'EMAs 2.00x': { t:0, w1:0, w2:0, l:0 }, 'WT 1.50x': { t:0, w1:0, w2:0, l:0 }, 'BKout 1.50x': { t:0, w1:0, w2:0, l:0 }, 'SK 2.00x': { t:0, w1:0, w2:0, l:0 } };
+        for(let sig of completedSignals) if(stats[sig.pattern]){ stats[sig.pattern].t++; if(sig.success1 && sig.success2===undefined) stats[sig.pattern].w1++; else if(sig.success1===false && sig.success2===true) stats[sig.pattern].w2++; else if(sig.success1===false && sig.success2===false) stats[sig.pattern].l++; }
+        const body = document.getElementById('signalsStatsBody'); body.innerHTML = '';
+        for(let tipo of ['EMAs 2.00x', 'WT 1.50x', 'BKout 1.50x', 'SK 2.00x']){ const s = stats[tipo]; const total = s.t; const aciertos = s.w1 + s.w2; const pct = total ? ((aciertos/total)*100).toFixed(1) : '0'; body.insertAdjacentHTML('beforeend', `<tr><td>${tipo}</td><td>${total}</td><td>${s.w1}</td><td>${s.w2}</td><td>${aciertos}</td><td>${s.l}</td><td>${pct}%</td></tr>`); }
+    }
+
+    // Nuevo: Obtener niveles altos con repeticiones >=5
+    function getHighMultiplierLevels() {
+        const countsYellow = new Map();
+        const countsPink = new Map();
+        for (let m of rawMultipliers) {
+            if (m >= 5.0 && m < 10.0) { const key = m.toFixed(2); countsYellow.set(key, (countsYellow.get(key) || 0) + 1); }
+            else if (m >= 10.0) { const key = m.toFixed(2); countsPink.set(key, (countsPink.get(key) || 0) + 1); }
+        }
+        const yellowLevels = Array.from(countsYellow.entries()).filter(([_,c]) => c >= 5).map(([v,_]) => parseFloat(v)).sort((a,b)=>a-b);
+        const pinkLevels = Array.from(countsPink.entries()).filter(([_,c]) => c >= 5).map(([v,_]) => parseFloat(v)).sort((a,b)=>a-b);
+        return { yellowLevels, pinkLevels };
+    }
+
+    function actualizarGrafico() {
+        if(!chartInstance) return;
+        const mostrar = sequenceLevels.slice(-maxPoints);
+        const colores = coloresPuntos.slice(-maxPoints);
+        const numPuntos = mostrar.length;
+        chartInstance.data.labels = mostrar.map((_,i)=> i+1);
+        chartInstance.data.datasets[24].data = [...mostrar];
+        chartInstance.data.datasets[24].pointBackgroundColor = colores;
+        const canvas = document.getElementById('mainChart');
+        const anchoCanvas = canvas.clientWidth;
+        let puntoRadio = 6, lineWidth = 2.5;
+        if (numPuntos > 0 && anchoCanvas > 0) { const espaciado = anchoCanvas / numPuntos; puntoRadio = Math.min(7, Math.max(3, espaciado / 10)); lineWidth = Math.max(1.5, puntoRadio * 0.5); }
+        chartInstance.data.datasets[24].pointRadius = puntoRadio;
+        chartInstance.data.datasets[24].pointBorderWidth = Math.max(1, puntoRadio * 0.3);
+        chartInstance.data.datasets[24].borderWidth = lineWidth;
+
+        const full = sequenceLevels;
+        if(full.length===0){
+            for(let i=0;i<=23;i++) if(chartInstance.data.datasets[i]) chartInstance.data.datasets[i].data=[];
+            chartInstance.update(); return;
+        }
+        const positions = getPositions();
+        const ema4 = calcEMA(positions, 4);
+        const ema8 = calcEMA(positions, 8);
+        const ema20 = calcEMA(positions, 20);
+        const trim = (arr) => arr.slice(-maxPoints);
+        const boll = calcBollinger20(full);
+        const srAvanzado = detectarSoportesResistenciasAvanzado(full);
+        
+        chartInstance.data.datasets[0].data = trim(boll.upper);
+        chartInstance.data.datasets[1].data = trim(boll.lower);
+        chartInstance.data.datasets[2].data = trim(ema4);
+        chartInstance.data.datasets[3].data = trim(ema8);
+        chartInstance.data.datasets[8].data = trim(ema20);
+        if(chartInstance.data.datasets[4]) chartInstance.data.datasets[4].data = (srAvanzado.soportes[0] ? new Array(mostrar.length).fill(srAvanzado.soportes[0].nivel) : []);
+        if(chartInstance.data.datasets[5]) chartInstance.data.datasets[5].data = (srAvanzado.soportes[1] ? new Array(mostrar.length).fill(srAvanzado.soportes[1].nivel) : []);
+        if(chartInstance.data.datasets[6]) chartInstance.data.datasets[6].data = (srAvanzado.resistencias[0] ? new Array(mostrar.length).fill(srAvanzado.resistencias[0].nivel) : []);
+        if(chartInstance.data.datasets[7]) chartInstance.data.datasets[7].data = (srAvanzado.resistencias[1] ? new Array(mostrar.length).fill(srAvanzado.resistencias[1].nivel) : []);
+
+        // Nuevas líneas amarillas/rosas
+        const { yellowLevels, pinkLevels } = getHighMultiplierLevels();
+        for(let i=0; i<10; i++) {
+            const ds = chartInstance.data.datasets[9 + i];
+            if(i < yellowLevels.length) { ds.data = new Array(mostrar.length).fill(yellowLevels[i]); ds.hidden = false; ds.borderColor = '#ffff00'; ds.label = `Soporte 5x-9.99x (${yellowLevels[i].toFixed(2)}x)`; }
+            else { ds.data = []; ds.hidden = true; }
+        }
+        for(let i=0; i<5; i++) {
+            const ds = chartInstance.data.datasets[19 + i];
+            if(i < pinkLevels.length) { ds.data = new Array(mostrar.length).fill(pinkLevels[i]); ds.hidden = false; ds.borderColor = '#ff69b4'; ds.label = `Soporte 10x+ (${pinkLevels[i].toFixed(2)}x)`; }
+            else { ds.data = []; ds.hidden = true; }
+        }
+
+        const toggles = {
+            boll: document.getElementById('toggleBollinger')?.checked ?? true,
+            ema4: document.getElementById('toggleEMA4')?.checked ?? true,
+            ema8: document.getElementById('toggleEMA8')?.checked ?? true,
+            ema20: document.getElementById('toggleEMA20')?.checked ?? true,
+            srAdvanced: document.getElementById('toggleSRlinesAdvanced')?.checked ?? true
+        };
+        for(let i=0;i<chartInstance.data.datasets.length;i++) if(i!==24) chartInstance.data.datasets[i].hidden = true;
+        if(toggles.boll) { chartInstance.data.datasets[0].hidden=false; chartInstance.data.datasets[1].hidden=false; }
+        if(toggles.ema4) chartInstance.data.datasets[2].hidden=false;
+        if(toggles.ema8) chartInstance.data.datasets[3].hidden=false;
+        if(toggles.ema20) chartInstance.data.datasets[8].hidden=false;
+        if(toggles.srAdvanced) { for(let i=4;i<=7;i++) if(chartInstance.data.datasets[i]) chartInstance.data.datasets[i].hidden=false; }
+        // Las líneas amarillas/rosas siempre visibles si existen
+        for(let i=0;i<10;i++) if(chartInstance.data.datasets[9+i] && chartInstance.data.datasets[9+i].data.length>0) chartInstance.data.datasets[9+i].hidden=false;
+        for(let i=0;i<5;i++) if(chartInstance.data.datasets[19+i] && chartInstance.data.datasets[19+i].data.length>0) chartInstance.data.datasets[19+i].hidden=false;
+        chartInstance.update();
+    }
+
+    function actualizarBarraResultados() { const container = document.getElementById('recentResultsBar'); if (!container) return; const fixedSpan = container.querySelector('span:first-child'); Array.from(container.children).filter(c => c !== fixedSpan).forEach(b => b.remove()); [...rawMultipliers].reverse().slice(0, 70).forEach(m => { let badge = document.createElement('span'); badge.className = 'result-badge'; if (m < 2) badge.classList.add('low'); else if (m < 3) badge.classList.add('medium'); else if (m < 5) badge.classList.add('high'); else if (m < 10) badge.classList.add('very-high'); else badge.classList.add('jackpot'); badge.textContent = m.toFixed(2); container.appendChild(badge); }); let badges = Array.from(container.children).filter(c => c !== fixedSpan); while (container.scrollWidth > container.clientWidth && badges.length > 0) { badges.pop().remove(); badges = Array.from(container.children).filter(c => c !== fixedSpan); } }
+
+    function scheduleClearMessage() { if(clearTimer) clearTimeout(clearTimer); clearTimer=setTimeout(()=>{ const circle = document.getElementById('alert-circulo'); circle.innerHTML = '🛜 NEUTRAL 🛜'; circle.style.display = 'flex'; document.getElementById('signalStatus').innerHTML = '---'; signalsEnabled = true; clearTimer = null; updateAlertCircleVisibility(); }, 10000); }
+
+    function initChart() {
+        const ctx = document.getElementById('mainChart').getContext('2d');
+        const datasets = [
+            { label: 'Bollinger Sup', data: [], borderColor: '#cc77ff', borderWidth: 1.5, borderDash: [5,3], pointRadius: 0 },
+            { label: 'Bollinger Inf', data: [], borderColor: '#cc77ff', borderWidth: 1.5, borderDash: [5,3], pointRadius: 0 },
+            { label: 'EMA 4', data: [], borderColor: '#00ffff', borderWidth: 2, pointRadius: 0, hidden: false },
+            { label: 'EMA 8', data: [], borderColor: '#ffff00', borderWidth: 2, pointRadius: 0, hidden: false },
+            { label: 'Soporte Avanzado 1', data: [], borderColor: '#2ecc71', borderWidth: 2, borderDash: [4,4], pointRadius: 0 },
+            { label: 'Soporte Avanzado 2', data: [], borderColor: '#2ecc71', borderWidth: 2, borderDash: [4,4], pointRadius: 0 },
+            { label: 'Resistencia Avanzada 1', data: [], borderColor: '#ff4444', borderWidth: 2, borderDash: [4,4], pointRadius: 0 },
+            { label: 'Resistencia Avanzada 2', data: [], borderColor: '#ff4444', borderWidth: 2, borderDash: [4,4], pointRadius: 0 },
+            { label: 'EMA 20', data: [], borderColor: '#ff8800', borderWidth: 2, pointRadius: 0, hidden: false }
+        ];
+        for(let i=0;i<10;i++) datasets.push({ label: `Yellow ${i}`, data: [], borderColor: '#ffff00', borderWidth: 2, pointRadius: 0, hidden: true });
+        for(let i=0;i<5;i++) datasets.push({ label: `Pink ${i}`, data: [], borderColor: '#ff69b4', borderWidth: 2, pointRadius: 0, hidden: true });
+        datasets.push({ label: 'Nivel Secuencia', data: [], borderColor: '#ffffff', borderWidth: 2.5, pointRadius: 4, pointBackgroundColor: [], pointBorderColor: '#111', tension: 0.2, fill: false });
+        datasets.push({ label: 'RSI (14)', data: [], borderColor: '#ff66cc', borderWidth: 1.5, pointRadius: 0, yAxisID: 'y1', hidden: true });
+        datasets.push({ label: 'MACD Línea', data: [], borderColor: '#ffff66', borderWidth: 1.5, pointRadius: 0, hidden: true });
+        datasets.push({ label: 'MACD Señal', data: [], borderColor: '#88ff88', borderWidth: 1.5, pointRadius: 0, hidden: true });
+        datasets.push({ label: 'WaveTrend', data: [], borderColor: '#aaffff', borderWidth: 2, pointRadius: 0, hidden: true });
+        datasets.push({ label: 'WT Señal', data: [], borderColor: '#ff8888', borderWidth: 2, pointRadius: 0, hidden: true });
+        chartInstance = new Chart(ctx, { type: 'line', data: { labels: [], datasets }, options: { responsive: true, maintainAspectRatio: true, animation: { duration: 200 }, scales: { y: { grid: { color: '#226622' }, title: { display: true, text: 'Nivel', color: '#ccffcc' } }, y1: { position: 'right', min: 0, max: 100, grid: { drawOnChartArea: false }, title: { text: 'RSI', color: '#ff99cc' } } }, plugins: { legend: { display: false } } } });
+        actualizarGrafico();
+    }
+
+    // ================= WEBSOCKET (backend) =================
+    let ws = null;
+    let reconnectTimer = null;
+    let lastAutoResult = null;
+    let autoEnabled = false; // para evitar duplicados
+
+    function conectarWS() {
+        if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) ws.close();
+        const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+        const wsUrl = `${protocol}//${window.location.host}/ws`;
+        ws = new WebSocket(wsUrl);
+        ws.onopen = () => {
+            document.getElementById('wsStatusIcon').innerHTML = '🟢 Auto conectado';
+            autoEnabled = true;
+            console.log('WebSocket conectado');
+        };
+        ws.onmessage = (event) => {
+            if (!modoAutomatico) return;
+            try {
+                const data = JSON.parse(event.data);
+                // Ignorar historial inicial
+                if (data.tipo === 'historial') return;
+                // Recibir multiplicador de cualquiera de los tres juegos
+                if ((data.tipo === 'crash' || data.tipo === 'slide' || data.tipo === 'spaceman') && data.maxMultiplier) {
+                    const mult = data.maxMultiplier;
+                    if (mult > 0 && mult !== lastAutoResult) {
+                        lastAutoResult = mult;
+                        addPoint(mult);
+                    }
+                }
+            } catch (err) { console.warn(err); }
+        };
+        ws.onclose = () => {
+            document.getElementById('wsStatusIcon').innerHTML = '🔴 Reconectando...';
+            autoEnabled = false;
+            if (reconnectTimer) clearTimeout(reconnectTimer);
+            reconnectTimer = setTimeout(() => conectarWS(), 3000);
+        };
+        ws.onerror = (err) => console.error('WebSocket error:', err);
+    }
+
+    function setModo(manual) {
+        modoAutomatico = !manual;
+        const manualDiv = document.getElementById('manualControls');
+        const btnMan = document.getElementById('btnManualMode');
+        const btnAuto = document.getElementById('btnAutoMode');
+        const modeTextSpan = document.getElementById('modeText');
+        if (modoAutomatico) {
+            btnMan.classList.remove('active');
+            btnAuto.classList.add('active');
+            manualDiv.classList.add('hidden-buttons');
+            modeTextSpan.innerText = 'Automático';
+            if (!ws || ws.readyState !== WebSocket.OPEN) conectarWS();
+            else autoEnabled = true;
+        } else {
+            btnAuto.classList.remove('active');
+            btnMan.classList.add('active');
+            manualDiv.classList.remove('hidden-buttons');
+            modeTextSpan.innerText = 'Manual';
+            if (ws) ws.close();
+            autoEnabled = false;
+            document.getElementById('wsStatusIcon').innerHTML = '🔌 Manual';
+        }
+    }
+
+    document.addEventListener('DOMContentLoaded', () => {
+        initChart();
+        setModo(true); // inicio en manual
+        actualizarEstadisticasSenales();
+
+        document.getElementById('btnManualMode')?.addEventListener('click', () => setModo(true));
+        document.getElementById('btnAutoMode')?.addEventListener('click', () => setModo(false));
+        document.getElementById('rangoVisual')?.addEventListener('change', (e) => { maxPoints = parseInt(e.target.value); actualizarGrafico(); });
+        document.getElementById('openIndicatorBtn')?.addEventListener('click', () => document.getElementById('indicatorPanel')?.classList.add('active'));
+        document.getElementById('closePanelBtn')?.addEventListener('click', () => document.getElementById('indicatorPanel')?.classList.remove('active'));
+        document.querySelectorAll('#indicatorPanel input').forEach(cb => cb.addEventListener('change', () => actualizarGrafico()));
+        document.getElementById('resetBtn')?.addEventListener('click', resetTodo);
+        document.getElementById('deleteLastBtn')?.addEventListener('click', deleteLast);
+        document.getElementById('btn1_1')?.addEventListener('click', () => { if (!modoAutomatico) addPoint(1.25); });
+        document.getElementById('btn1_2')?.addEventListener('click', () => { if (!modoAutomatico) addPoint(1.75); });
+        document.getElementById('btn2_2')?.addEventListener('click', () => { if (!modoAutomatico) addPoint(2.5); });
+        document.getElementById('btn3_3')?.addEventListener('click', () => { if (!modoAutomatico) addPoint(4.0); });
+        document.getElementById('btn4_4')?.addEventListener('click', () => { if (!modoAutomatico) addPoint(7.0); });
+        document.getElementById('btn5_5')?.addEventListener('click', () => { if (!modoAutomatico) addPoint(12.0); });
+        window.addEventListener('resize', () => { if (chartInstance) chartInstance.resize(); actualizarGrafico(); });
+        updateAlertCircleVisibility();
+    });
+</script>
+</body>
+</html>
